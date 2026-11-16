@@ -7,5 +7,12 @@ from supermimic_pytorch.supermimic import (
 )
 
 def test_supermimic():
-    wm = WorldModel()
-    assert True
+    world_model = WorldModel()
+
+    state = torch.randn(3, 71)
+    actions = torch.randn(3, 29)
+    sim_context = torch.randn(3, 33)
+
+    next_state = world_model(state, actions, sim_context)
+
+    assert state.shape == next_state.shape
