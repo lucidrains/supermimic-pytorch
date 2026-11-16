@@ -1,8 +1,9 @@
 from __future__ import annotations
+from collections import namedtuple
 
 import torch
 from torch import Tensor
-from torch.nn import Module
+from torch.nn import Module, Linear
 import torch.nn.functional as F
 
 # ein equations
@@ -23,10 +24,17 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def last(arr):
+    return arr[-1]
+
 def compact(*arr):
     return tuple(filter(exists, arr))
 
 # world model
+
+Predictions = namedtuple('Predictions', ('state', 'terminal', 'reward'))
+
+Losses = namedtuple('Losses', ('state', 'terminal', 'reward'))
 
 class WorldModel(Module):
     def __init__(
@@ -37,41 +45,113 @@ class WorldModel(Module):
         dim_sim_context = 33,
         dim_hiddens: tuple[int, ...] = (2048, 2048, 2048),
         normed_mlp = False,
-        pred_residual_state = True
+        pred_residual_state = True,
+        pred_terminal = True,
+        pred_reward = False,
+        state_loss_weight = 1.,
+        reward_loss_weight = 1.,
+        terminal_loss_weight = 1.
     ):
         super().__init__()
+        assert len(dim_hiddens) > 0
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
         dim_in = dim_state + dim_action + dim_sim_context
         dim_out = dim_state
 
-        self.transition_mlp = mlp_klass(dim_in, *dim_hiddens, dim_out)
+        # backbone
+
+        self.transition_mlp = mlp_klass(dim_in, *dim_hiddens)
+
+        # predictions
+
+        dim_embed = last(dim_hiddens)
+        self.to_state_pred = Linear(dim_embed, dim_state, bias = False)
+        self.to_reward_pred = Linear(dim_embed, 1, bias = False) if pred_reward else None
+        self.to_terminal_pred = Linear(dim_embed, 1, bias = False) if pred_terminal else None
 
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_state = pred_residual_state
+
+        # losses
+
+        self.state_loss_weight = state_loss_weight
+        self.reward_loss_weight = reward_loss_weight
+        self.terminal_loss_weight = terminal_loss_weight
 
     def forward(
         self,
         state,                                  # (b dim_state)
         actions,                                # (b dim_action)
-        sim_context: Tensor | None = None       # (b dim_sim_context)
+        sim_context: Tensor | None = None,      # (b dim_sim_context)
+        next_state: Tensor | None = None,
+        next_terminal: Tensor | None = None,
+        next_reward: Tensor | None = None
     ):
         assert self.has_sim_context or exists(sim_context)
 
         # world model is just a forward dynamics model f(s, a) -> s'
         # with simulation context (domain randomization presumably)
 
-        pred = self.transition_mlp(compact(state, actions, sim_context))
+        embed = self.transition_mlp(compact(state, actions, sim_context))
 
         # whether predicting residual state or not
 
-        if self.pred_residual_state:
-            next_state = pred + state
-        else:
-            next_state = pred
+        pred_state = self.to_state_pred(embed)
 
-        return next_state
+        pred_next_state = pred_state
+
+        if self.pred_residual_state:
+            pred_next_state = pred_next_state + state
+
+        # maybe rewards
+
+        pred_reward = None
+
+        if exists(self.to_reward_pred):
+            pred_reward = self.to_reward_pred(embed)
+            pred_reward = rearrange(pred_reward, '... 1 -> ...')
+
+        # maybe terminal
+
+        pred_terminal = None
+
+        if exists(self.to_terminal_pred):
+            pred_terminal = self.to_terminal_pred(embed)
+            pred_terminal = rearrange(pred_terminal, '... 1 -> ...')
+
+        # outputs
+
+        pred = Predictions(pred_state, pred_terminal, pred_reward)
+
+        # maybe loss
+
+        need_loss = exists(next_state) or exists(next_terminal) or exists(next_reward)
+
+        if not need_loss:
+            return pred
+
+        total_loss = 0.
+        state_loss = reward_loss = terminal_loss = None
+
+        if exists(next_state):
+            state_loss = F.mse_loss(next_state, pred_next_state)
+            total_loss = total_loss + state_loss * self.state_loss_weight
+
+        if exists(next_reward):
+            assert exists(pred_reward)
+            reward_loss = F.mse_loss(next_reward, pred_reward)
+            total_loss = total_loss + reward_loss * self.reward_loss_weight
+
+        if exists(next_terminal):
+            assert exists(pred_terminal)
+            terminal_loss = F.binary_cross_entropy_from_logits(pred_terminal, next_terminal.float())
+            total_loss = total_loss + terminal_loss * self.terminal_loss_weight
+
+        losses = Losses(state_loss, terminal_loss, reward_loss)
+
+        return total_loss, pred, losses
 
 # main class
 
