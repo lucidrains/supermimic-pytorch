@@ -1,3 +1,5 @@
+<img src="./fig2.png" width="400px"></img>
+
 ## Supermimic - Pytorch (wip)
 
 Unofficial implementation of [Supermimic, Scaling Humanoid Whole-Body Control with One Differentiable World Model](https://supermimic.github.io/), from Qiayuan Liao et al. of Berkeley
