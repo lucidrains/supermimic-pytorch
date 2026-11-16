@@ -9,6 +9,7 @@ import torch.nn.functional as F
 # ein equations
 
 from einops import rearrange
+from torch_einops_utils import binary_cross_entropy_with_logits
 from torch_einops_utils.shape import size, shape
 
 # mlps
@@ -58,7 +59,6 @@ class WorldModel(Module):
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
         dim_in = dim_state + dim_action + dim_sim_context
-        dim_out = dim_state
 
         # backbone
 
@@ -70,6 +70,11 @@ class WorldModel(Module):
         self.to_state_pred = Linear(dim_embed, dim_state, bias = False)
         self.to_reward_pred = Linear(dim_embed, 1, bias = False) if pred_reward else None
         self.to_terminal_pred = Linear(dim_embed, 1, bias = False) if pred_terminal else None
+
+        # zero init residual head -> starts as identity dynamics
+
+        if pred_residual_state:
+            torch.nn.init.zeros_(self.to_state_pred.weight)
 
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_state = pred_residual_state
@@ -89,7 +94,7 @@ class WorldModel(Module):
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
-        assert self.has_sim_context or exists(sim_context)
+        assert self.has_sim_context == exists(sim_context)
 
         # world model is just a forward dynamics model f(s, a) -> s'
         # with simulation context (domain randomization presumably)
@@ -123,7 +128,7 @@ class WorldModel(Module):
 
         # outputs
 
-        pred = Predictions(pred_state, pred_terminal, pred_reward)
+        pred = Predictions(pred_next_state, pred_terminal, pred_reward)
 
         # maybe loss
 
@@ -146,7 +151,7 @@ class WorldModel(Module):
 
         if exists(next_terminal):
             assert exists(pred_terminal)
-            terminal_loss = F.binary_cross_entropy_from_logits(pred_terminal, next_terminal.float())
+            terminal_loss = binary_cross_entropy_with_logits(pred_terminal, next_terminal)
             total_loss = total_loss + terminal_loss * self.terminal_loss_weight
 
         losses = Losses(state_loss, terminal_loss, reward_loss)
@@ -163,6 +168,9 @@ class SuperMimic(Module):
         world_model: WorldModel | Module
     ):
         super().__init__()
+
+        self.policy = policy
+        self.world_model = world_model
 
     def forward(
         self
