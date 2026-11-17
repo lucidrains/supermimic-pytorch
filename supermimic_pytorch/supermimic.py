@@ -17,6 +17,10 @@ from torch_einops_utils.shape import size, shape
 from x_mlps_pytorch import MLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
+# gae for the horizon = 16 version, but not necessary
+
+from x_ppo import calc_gae
+
 # functions
 
 def exists(v):
@@ -232,7 +236,7 @@ class SuperMimic(Module):
         initial_state,
         sim_context: Tensor | None = None,
         actor_cond: Tensor | None = None,
-        num_rollout_steps = 16
+        num_rollout_steps = 32
     ):
         actor, world_model = self.actor, self.world_model
 
