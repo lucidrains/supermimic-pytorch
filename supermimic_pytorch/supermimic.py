@@ -243,6 +243,7 @@ class SuperMimic(Module):
         self,
         initial_state,
         sim_context: Tensor | None = None,
+        actor_goals: Tensor | None = None,
         actor_cond: Tensor | None = None,
         num_rollout_steps = 32
     ):
@@ -260,20 +261,32 @@ class SuperMimic(Module):
         state = initial_state
 
         has_observation_noise = exists(self.observation_noise_scale)
+        actor_has_goal = exists(actor_goals)
 
         with frozen(world_model, eval = True):
 
-            for _ in range(num_rollout_steps):
+            for time_index in range(num_rollout_steps):
+
+                # actor forward
+
                 obs = state
 
                 if has_observation_noise:
                     obs = state + uniform_like(state, self.observation_noise_scale)
 
-                action = actor(compact(obs, actor_cond))
+                actor_goal = actor_goals[:, time_index] if actor_has_goal else None
+
+                action = actor(compact(obs, actor_goal, actor_cond))
+
+                # world model prediction
 
                 pred = world_model(state, action, sim_context)
 
+                # next state
+
                 next_state = pred.state
+
+                # accumulate
 
                 states.append(next_state)
                 actions.append(action)

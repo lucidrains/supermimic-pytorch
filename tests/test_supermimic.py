@@ -117,24 +117,32 @@ def test_world_model_rollout():
     assert has_grads(world_model)
 
 @param('actor_condition', (False, True))
+@param('actor_goal', (False, True))
 @param('observation_noise_scale', (None, 0.5))
 def test_actor_rollout(
     actor_condition,
+    actor_goal,
     observation_noise_scale
 ):
 
     # maybe condition
 
-    dim_cond = 0
+    dim_cond = dim_goal = 0
+
     cond = None
+    goals = None
 
     if actor_condition:
         dim_cond = 8
         cond = torch.randn(2, 8)
 
+    if actor_goal:
+        goals = torch.randn(2, 5, 3)
+        dim_goal = goals.shape[-1]
+
     # networks
 
-    actor = MLP(71 + dim_cond, 2048, 1024, 512, 256, 29, activation = nn.GELU())
+    actor = MLP(71 + dim_cond + dim_goal, 2048, 1024, 512, 256, 29, activation = nn.GELU())
 
     world_model = WorldModel(
         dim_hiddens = (1024, 1024),
@@ -152,7 +160,7 @@ def test_actor_rollout(
     initial_state = torch.randn(2, 71)
     sim_context = torch.randn(2, 33)
 
-    rollout = supermimic(initial_state, sim_context, actor_cond = cond, num_rollout_steps = 4)
+    rollout = supermimic(initial_state, sim_context, actor_goals = goals, actor_cond = cond, num_rollout_steps = 4)
 
     assert rollout.states.shape == (2, 5, 71)
     assert rollout.actions.shape == (2, 4, 29)
