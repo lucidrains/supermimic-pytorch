@@ -3,7 +3,9 @@ import torch
 import pytest
 param = pytest.mark.parametrize
 
-from supermimic_pytorch.supermimic import WorldModel
+from x_mlps_pytorch import MLP
+
+from supermimic_pytorch.supermimic import WorldModel, SuperMimic
 
 def exists(v):
     return v is not None
@@ -69,3 +71,38 @@ def test_world_model(
 
     if check_identity:
         assert torch.allclose(preds.state, state)
+
+def test_rollout():
+    policy = MLP(71, 16, 29)
+
+    world_model = WorldModel(
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        pred_residual_state = False
+    )
+
+    supermimic = SuperMimic(policy = policy, world_model = world_model)
+
+    initial_state = torch.randn(2, 71)
+    sim_context = torch.randn(2, 33)
+
+    rollout = supermimic(initial_state, sim_context, num_rollout_steps = 4)
+
+    assert rollout.states.shape == (2, 5, 71)
+    assert rollout.actions.shape == (2, 4, 29)
+    assert rollout.rewards.shape == (2, 4)
+    assert rollout.terminals.shape == (2, 4)
+
+    # trajectory starts at the given state
+
+    assert torch.allclose(rollout.states[:, 0], initial_state)
+
+    # bptt reaches the policy through the world model
+
+    rollout.rewards.sum().backward()
+    assert any(exists(p.grad) for p in policy.parameters())
+
+    # but the world model weights stay frozen
+
+    assert not any(exists(p.grad) for p in world_model.parameters())

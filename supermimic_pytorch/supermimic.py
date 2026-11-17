@@ -9,7 +9,7 @@ import torch.nn.functional as F
 # ein equations
 
 from einops import rearrange
-from torch_einops_utils import binary_cross_entropy_with_logits
+from torch_einops_utils import binary_cross_entropy_with_logits, frozen
 from torch_einops_utils.shape import size, shape
 
 # mlps
@@ -70,6 +70,9 @@ class WorldModel(Module):
         self.to_state_pred = Linear(dim_embed, dim_state, bias = False)
         self.to_reward_pred = Linear(dim_embed, 1, bias = False) if pred_reward else None
         self.to_terminal_pred = Linear(dim_embed, 1, bias = False) if pred_terminal else None
+
+        self.pred_reward = pred_reward
+        self.pred_terminal = pred_terminal
 
         # zero init residual head -> starts as identity dynamics
 
@@ -160,6 +163,8 @@ class WorldModel(Module):
 
 # main class
 
+Rollout = namedtuple('Rollout', ('states', 'actions', 'terminals', 'rewards'))
+
 class SuperMimic(Module):
     def __init__(
         self,
@@ -173,6 +178,46 @@ class SuperMimic(Module):
         self.world_model = world_model
 
     def forward(
-        self
+        self,
+        initial_state,
+        sim_context: Tensor | None = None,
+        num_rollout_steps = 16
     ):
-        raise NotImplementedError
+        policy, world_model = self.policy, self.world_model
+
+        pred_reward, pred_terminal = self.world_model.pred_reward, self.world_model.pred_terminal
+
+        # rollout policy within the world model
+
+        states = [initial_state]
+        actions = []
+        rewards = []
+        terminals = []
+
+        state = initial_state
+
+        with frozen(world_model, eval = True):
+
+            for _ in range(num_rollout_steps):
+                action = policy(state)
+
+                pred = world_model(state, action, sim_context)
+
+                next_state = pred.state
+
+                states.append(next_state)
+                actions.append(action)
+                rewards.append(pred.reward)
+                terminals.append(pred.terminal)
+
+                state = next_state
+
+        # return all intermediates
+
+        states = rearrange(states, 't b ... -> b t ...')
+        actions = rearrange(actions, 't b ... -> b t ...')
+
+        rewards = rearrange(rewards, 't b -> b t') if pred_reward else None
+        terminals = rearrange(terminals, 't b -> b t') if pred_terminal else None
+
+        return Rollout(states, actions, terminals, rewards)
