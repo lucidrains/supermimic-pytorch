@@ -4,3 +4,7 @@ from supermimic_pytorch.supermimic import (
     HumanoidActor,
     SuperMimic
 )
+
+from supermimic_pytorch.latent_world_model import (
+    LatentWorldModel
+)
