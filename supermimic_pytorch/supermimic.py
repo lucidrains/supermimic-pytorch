@@ -88,21 +88,71 @@ class WorldModel(Module):
         self.reward_loss_weight = reward_loss_weight
         self.terminal_loss_weight = terminal_loss_weight
 
+    def rollout(
+        self,
+        state,
+        actions,                                 # (b time dim_action)
+        next_states: Tensor,                     # (b time ...)
+        sim_context: Tensor | None = None,       # (b dim_sim_context)
+        next_terminals: Tensor | None = None,    # (b time ...)
+        next_rewards: Tensor | None = None       # (b time ...)
+    ):
+        num_steps = size(actions, 'b [t] ...')
+
+        # accumulants
+
+        all_preds = []
+        all_losses = []
+        total_loss = 0.
+
+        # rollout across timesteps
+
+        for time_index in range(num_steps):
+            action = actions[:, time_index]
+            next_state = next_states[:, time_index]
+
+            next_terminal = next_reward = None
+
+            if exists(next_terminals):
+                next_terminal = next_terminals[:, time_index]
+
+            if exists(next_rewards):
+                next_reward = next_rewards[:, time_index]
+
+            loss, pred, losses = self(
+                state,
+                action,
+                sim_context,
+                next_state,
+                next_terminal,
+                next_reward
+            )
+
+            total_loss = total_loss + loss
+
+            all_preds.append(pred)
+            all_losses.append(losses)
+
+            state = pred.state # feed prediction back in
+
+        return total_loss, all_preds, all_losses
+
     def forward(
         self,
         state,                                  # (b dim_state)
-        actions,                                # (b dim_action)
+        action,                                 # (b dim_action)
         sim_context: Tensor | None = None,      # (b dim_sim_context)
         next_state: Tensor | None = None,
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
+        assert action.ndim == 2, 'use `rollout` for a rollout loss'
         assert self.has_sim_context == exists(sim_context)
 
         # world model is just a forward dynamics model f(s, a) -> s'
         # with simulation context (domain randomization presumably)
 
-        embed = self.transition_mlp(compact(state, actions, sim_context))
+        embed = self.transition_mlp(compact(state, action, sim_context))
 
         # whether predicting residual state or not
 
@@ -169,26 +219,26 @@ class SuperMimic(Module):
     def __init__(
         self,
         *,
-        policy: MLP | Module,
+        actor: MLP | NormedMLP | Module,
         world_model: WorldModel | Module
     ):
         super().__init__()
 
-        self.policy = policy
+        self.actor = actor
         self.world_model = world_model
 
     def forward(
         self,
         initial_state,
         sim_context: Tensor | None = None,
-        policy_cond: Tensor | None = None,
+        actor_cond: Tensor | None = None,
         num_rollout_steps = 16
     ):
-        policy, world_model = self.policy, self.world_model
+        actor, world_model = self.actor, self.world_model
 
         pred_reward, pred_terminal = self.world_model.pred_reward, self.world_model.pred_terminal
 
-        # rollout policy within the world model
+        # rollout actor within the world model
 
         states = [initial_state]
         actions = []
@@ -200,7 +250,7 @@ class SuperMimic(Module):
         with frozen(world_model, eval = True):
 
             for _ in range(num_rollout_steps):
-                action = policy(compact(state, policy_cond))
+                action = actor(compact(state, actor_cond))
 
                 pred = world_model(state, action, sim_context)
 

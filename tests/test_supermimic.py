@@ -1,4 +1,6 @@
 import torch
+from torch import nn
+import torch.nn.functional as F
 
 import pytest
 param = pytest.mark.parametrize
@@ -9,6 +11,9 @@ from supermimic_pytorch.supermimic import WorldModel, SuperMimic
 
 def exists(v):
     return v is not None
+
+def has_grads(module):
+    return any(exists(p.grad) for p in module.parameters())
 
 @param(
     'world_model_kwargs, use_sim_context, targets, check_identity',
@@ -72,9 +77,48 @@ def test_world_model(
     if check_identity:
         assert torch.allclose(preds.state, state)
 
-@param('policy_condition', (False, True))
-def test_rollout(
-    policy_condition
+def test_world_model_rollout():
+    world_model = WorldModel(
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        pred_residual_state = False
+    )
+
+    state = torch.randn(3, 71)
+    actions = torch.randn(3, 8, 29)
+    next_states = torch.randn(3, 8, 71)
+    next_terminals = torch.randint(0, 2, (3, 8)).float()
+    next_rewards = torch.randn(3, 8)
+    sim_context = torch.randn(3, 33)
+
+    total_loss, preds, losses = world_model.rollout(
+        state, actions, next_states, sim_context, next_terminals, next_rewards
+    )
+
+    assert len(preds) == len(losses) == 8
+    assert preds[0].state.shape == (3, 71)
+
+    # total loss is the summed per step loss
+
+    assert torch.allclose(total_loss, sum(sum(component for component in l if exists(component)) for l in losses))
+
+    # autoregressive -> step 1 rolled from step 0's prediction
+
+    first_pred, second_pred, *_ = preds
+    _, second_action, *_ = actions.unbind(dim = 1)
+    _, second_next_state, *_ = next_states.unbind(dim = 1)
+
+    _, step_pred, _ = world_model(first_pred.state, second_action, sim_context, second_next_state)
+
+    assert torch.allclose(step_pred.state, second_pred.state)
+
+    total_loss.backward()
+    assert has_grads(world_model)
+
+@param('actor_condition', (False, True))
+def test_actor_rollout(
+    actor_condition
 ):
 
     # maybe condition
@@ -82,13 +126,13 @@ def test_rollout(
     dim_cond = 0
     cond = None
 
-    if policy_condition:
+    if actor_condition:
         dim_cond = 8
         cond = torch.randn(2, 8)
 
     # networks
 
-    policy = MLP(71 + dim_cond, 1024, 1024, 29)
+    actor = MLP(71 + dim_cond, 2048, 1024, 512, 256, 29, activation = nn.GELU())
 
     world_model = WorldModel(
         dim_hiddens = (1024, 1024),
@@ -97,12 +141,12 @@ def test_rollout(
         pred_residual_state = False
     )
 
-    supermimic = SuperMimic(policy = policy, world_model = world_model)
+    supermimic = SuperMimic(actor = actor, world_model = world_model)
 
     initial_state = torch.randn(2, 71)
     sim_context = torch.randn(2, 33)
 
-    rollout = supermimic(initial_state, sim_context, policy_cond = cond, num_rollout_steps = 4)
+    rollout = supermimic(initial_state, sim_context, actor_cond = cond, num_rollout_steps = 4)
 
     assert rollout.states.shape == (2, 5, 71)
     assert rollout.actions.shape == (2, 4, 29)
@@ -113,11 +157,11 @@ def test_rollout(
 
     assert torch.allclose(rollout.states[:, 0], initial_state)
 
-    # bptt reaches the policy through the world model
+    # bptt reaches the actor through the world model
 
     rollout.rewards.sum().backward()
-    assert any(exists(p.grad) for p in policy.parameters())
+    assert has_grads(actor)
 
     # but the world model weights stay frozen
 
-    assert not any(exists(p.grad) for p in world_model.parameters())
+    assert not has_grads(world_model)
