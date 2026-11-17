@@ -2,14 +2,14 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import Tensor
+from torch import Tensor, as_tensor
 from torch.nn import Module, Linear
 import torch.nn.functional as F
 
 # ein equations
 
 from einops import rearrange
-from torch_einops_utils import binary_cross_entropy_with_logits, frozen
+from torch_einops_utils import binary_cross_entropy_with_logits, frozen, uniform_like
 from torch_einops_utils.shape import size, shape
 
 # mlps
@@ -224,12 +224,20 @@ class SuperMimic(Module):
         self,
         *,
         actor: MLP | NormedMLP | Module,
-        world_model: WorldModel | Module
+        world_model: WorldModel | Module,
+        observation_noise_scale = None
     ):
         super().__init__()
 
         self.actor = actor
         self.world_model = world_model
+
+        # observation noise for the actor
+
+        if exists(observation_noise_scale):
+            observation_noise_scale = as_tensor(observation_noise_scale)
+
+        self.register_buffer('observation_noise_scale', observation_noise_scale)
 
     def forward(
         self,
@@ -251,10 +259,17 @@ class SuperMimic(Module):
 
         state = initial_state
 
+        has_observation_noise = exists(self.observation_noise_scale)
+
         with frozen(world_model, eval = True):
 
             for _ in range(num_rollout_steps):
-                action = actor(compact(state, actor_cond))
+                obs = state
+
+                if has_observation_noise:
+                    obs = state + uniform_like(state, self.observation_noise_scale)
+
+                action = actor(compact(obs, actor_cond))
 
                 pred = world_model(state, action, sim_context)
 

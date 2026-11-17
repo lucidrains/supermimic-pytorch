@@ -117,8 +117,10 @@ def test_world_model_rollout():
     assert has_grads(world_model)
 
 @param('actor_condition', (False, True))
+@param('observation_noise_scale', (None, 0.5))
 def test_actor_rollout(
-    actor_condition
+    actor_condition,
+    observation_noise_scale
 ):
 
     # maybe condition
@@ -141,7 +143,11 @@ def test_actor_rollout(
         pred_residual_state = False
     )
 
-    supermimic = SuperMimic(actor = actor, world_model = world_model)
+    supermimic = SuperMimic(
+        actor = actor,
+        world_model = world_model,
+        observation_noise_scale = observation_noise_scale
+    )
 
     initial_state = torch.randn(2, 71)
     sim_context = torch.randn(2, 33)
