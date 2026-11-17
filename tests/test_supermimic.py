@@ -72,11 +72,26 @@ def test_world_model(
     if check_identity:
         assert torch.allclose(preds.state, state)
 
-def test_rollout():
-    policy = MLP(71, 16, 29)
+@param('policy_condition', (False, True))
+def test_rollout(
+    policy_condition
+):
+
+    # maybe condition
+
+    dim_cond = 0
+    cond = None
+
+    if policy_condition:
+        dim_cond = 8
+        cond = torch.randn(2, 8)
+
+    # networks
+
+    policy = MLP(71 + dim_cond, 1024, 1024, 29)
 
     world_model = WorldModel(
-        dim_hiddens = (16,),
+        dim_hiddens = (1024, 1024),
         pred_reward = True,
         pred_terminal = True,
         pred_residual_state = False
@@ -87,7 +102,7 @@ def test_rollout():
     initial_state = torch.randn(2, 71)
     sim_context = torch.randn(2, 33)
 
-    rollout = supermimic(initial_state, sim_context, num_rollout_steps = 4)
+    rollout = supermimic(initial_state, sim_context, policy_cond = cond, num_rollout_steps = 4)
 
     assert rollout.states.shape == (2, 5, 71)
     assert rollout.actions.shape == (2, 4, 29)

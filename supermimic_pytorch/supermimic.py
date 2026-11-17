@@ -181,6 +181,7 @@ class SuperMimic(Module):
         self,
         initial_state,
         sim_context: Tensor | None = None,
+        policy_cond: Tensor | None = None,
         num_rollout_steps = 16
     ):
         policy, world_model = self.policy, self.world_model
@@ -199,7 +200,7 @@ class SuperMimic(Module):
         with frozen(world_model, eval = True):
 
             for _ in range(num_rollout_steps):
-                action = policy(state)
+                action = policy(compact(state, policy_cond))
 
                 pred = world_model(state, action, sim_context)
 
