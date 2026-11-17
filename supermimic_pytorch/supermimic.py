@@ -3,7 +3,7 @@ from collections import namedtuple
 
 import torch
 from torch import Tensor, as_tensor
-from torch.nn import Module, Linear
+from torch.nn import Module, Linear, Sequential, Tanh, GELU, Identity
 import torch.nn.functional as F
 
 # ein equations
@@ -14,7 +14,7 @@ from torch_einops_utils.shape import size, shape
 
 # mlps
 
-from x_mlps_pytorch import MLP
+from x_mlps_pytorch import MLP, MimoMLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
 # gae for the horizon = 16 version, but not necessary
@@ -34,6 +34,65 @@ def last(arr):
 
 def compact(*arr):
     return tuple(filter(exists, arr))
+
+# actor
+
+class HumanoidActor(Module):
+    """unitree humanoid actor"""
+
+    def __init__(
+        self,
+        *,
+        dim_obs = 93,
+        dim_action = 29,
+        dim_goal = 71,
+        dim_command = 3,
+        num_obs_frames = 10,
+        num_goal_frames = 10,
+        dim_latent = 32,
+        dim_hiddens = (2048, 1024, 512, 256),
+        dim_velocity_hiddens = (256, 256),
+        activation = GELU()
+    ):
+        super().__init__()
+
+        motion_encoder = Sequential(
+            MLP(num_goal_frames * dim_goal, *dim_hiddens, dim_latent, activation = activation),
+            Tanh()
+        )
+
+        velocity_encoder = Sequential(
+            MLP(dim_command + num_obs_frames * dim_obs, *dim_velocity_hiddens, dim_latent, activation = activation),
+            Tanh()
+        )
+
+        self.net = MimoMLP(
+            dim_latent + num_obs_frames * dim_obs,
+            *dim_hiddens,
+            dim_action,
+            inputs = (motion_encoder, velocity_encoder, Identity()),
+            activation = activation
+        )
+
+    def forward(
+        self,
+        obs,                                # (b num_obs_frames dim_obs)
+        goal = None,                        # (b num_goal_frames dim_goal)
+        command = None                      # (b dim_command) normalized velocity command
+    ):
+        is_motion = exists(goal)
+        assert is_motion != exists(command), 'pass either goal or command'
+
+        obs = rearrange(obs, 'b h d -> b (h d)')
+        goal = rearrange(goal, 'b k d -> b (k d)') if is_motion else None
+
+        velocity_input = (command, obs) if not is_motion else None
+        select_inputs = (0 if is_motion else 1, 2)
+
+        # (motion goal, (velocity command, obs history), obs history)
+
+        inputs = (goal, velocity_input, obs)
+        return self.net(inputs, select_inputs = select_inputs)
 
 # world model
 

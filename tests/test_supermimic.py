@@ -15,6 +15,20 @@ def exists(v):
 def has_grads(module):
     return any(exists(p.grad) for p in module.parameters())
 
+def test_humanoid_actor_forward():
+    from x_mlps_pytorch import MimoMLP
+    from supermimic_pytorch.supermimic import HumanoidActor
+
+    actor = HumanoidActor(dim_hiddens = (16,))
+
+    obs = torch.randn(2, 10, 93)
+    goal = torch.randn(2, 10, 71)
+
+    action = actor(obs, goal)
+
+    assert isinstance(actor.net, MimoMLP)
+    assert action.shape == (2, 29)
+
 @param(
     'world_model_kwargs, use_sim_context, targets, check_identity',
     [
