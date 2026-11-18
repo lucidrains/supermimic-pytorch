@@ -8,7 +8,7 @@ import torch.nn.functional as F
 
 # ein equations
 
-from einops import rearrange
+from einops import rearrange, pack
 from torch_einops_utils import binary_cross_entropy_with_logits, frozen, uniform_like
 from torch_einops_utils.shape import size, shape
 
@@ -17,9 +17,10 @@ from torch_einops_utils.shape import size, shape
 from x_mlps_pytorch import MLP, MimoMLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
-# gae for the horizon = 16 version, but not necessary
+# gae for learning the critic for the horizon = 16 version, but not necessary
 
 from x_ppo import calc_gae
+from assoc_scan import AssocScan
 
 # functions
 
@@ -239,8 +240,9 @@ class WorldModel(Module):
         pred_terminal = None
 
         if exists(self.to_terminal_pred):
-            pred_terminal = self.to_terminal_pred(embed)
-            pred_terminal = rearrange(pred_terminal, '... 1 -> ...')
+            pred_terminal_logit = self.to_terminal_pred(embed)
+            pred_terminal_logit = rearrange(pred_terminal_logit, '... 1 -> ...')
+            pred_terminal = pred_terminal_logit.sigmoid()
 
         # outputs
 
@@ -267,7 +269,7 @@ class WorldModel(Module):
 
         if exists(next_terminal):
             assert exists(pred_terminal)
-            terminal_loss = binary_cross_entropy_with_logits(pred_terminal, next_terminal)
+            terminal_loss = binary_cross_entropy_with_logits(pred_terminal_logit, next_terminal)
             total_loss = total_loss + terminal_loss * self.terminal_loss_weight
 
         losses = Losses(state_loss, terminal_loss, reward_loss)
@@ -284,12 +286,18 @@ class SuperMimic(Module):
         *,
         actor: MLP | NormedMLP | Module,
         world_model: WorldModel | Module,
-        observation_noise_scale = None
+        observation_noise_scale = None,
+        discount_factor = 0.99
     ):
         super().__init__()
 
         self.actor = actor
         self.world_model = world_model
+
+        # discount factor, for loss as well as gae (once critic is involved)
+
+        self.assoc_scan = AssocScan(reverse = True)
+        self.discount_factor = discount_factor
 
         # observation noise for the actor
 
@@ -298,13 +306,48 @@ class SuperMimic(Module):
 
         self.register_buffer('observation_noise_scale', observation_noise_scale)
 
+    def actor_loss(
+        self,
+        rewards,                # (b t)
+        pred_terminal,          # (b t)
+        bootstrap_value = None, # (b)
+        discount_factor = None
+    ):
+        # rewards[t] = r_{t+1}, pred_terminal[t] = d_{t+1} -> aligned, as in eq (2)
+
+        assert size(pred_terminal, 'b [t]') == size(rewards, 'b [t]')
+
+        # following eq (2) in the paper
+        # rewards are derived analytically from world model next state predictions, actions, mocap related references
+
+        discount_factor = default(discount_factor, self.discount_factor)
+
+        gates = discount_factor * (1. - pred_terminal)
+
+        # maybe append the bootstrap value, for horizons 16 or less
+
+        if exists(bootstrap_value):
+            rewards, _ = pack([rewards, bootstrap_value], 'b *')
+            gates, _ = pack([gates, torch.ones_like(bootstrap_value)], 'b *')
+
+        # reverse assoc scan
+
+        scanned = self.assoc_scan(gates, rewards)
+        discounted_sum_rewards = scanned[:, 0]
+
+        # maximize rewards
+
+        loss = -discounted_sum_rewards.mean()
+
+        return loss
+
     def forward(
         self,
         initial_state,
         sim_context: Tensor | None = None,
         actor_goals: Tensor | None = None,
         actor_cond: Tensor | None = None,
-        num_rollout_steps = 32
+        num_rollout_timesteps = 32
     ):
         actor, world_model = self.actor, self.world_model
 
@@ -324,7 +367,7 @@ class SuperMimic(Module):
 
         with frozen(world_model, eval = True):
 
-            for time_index in range(num_rollout_steps):
+            for time_index in range(num_rollout_timesteps):
 
                 # actor forward
 

@@ -81,7 +81,7 @@ def test_latent_world_model():
     actor = MLP(71, 16, 29, activation = nn.GELU())
     supermimic = SuperMimic(actor = actor, world_model = world_model)
 
-    rollout = supermimic(torch.randn(2, 71), torch.randn(2, 33), num_rollout_steps = 2)
+    rollout = supermimic(torch.randn(2, 71), torch.randn(2, 33), num_rollout_timesteps = 2)
 
     rollout.rewards.sum().backward()
 

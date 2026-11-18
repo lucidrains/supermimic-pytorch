@@ -174,7 +174,7 @@ def test_actor_rollout(
     initial_state = torch.randn(2, 71)
     sim_context = torch.randn(2, 33)
 
-    rollout = supermimic(initial_state, sim_context, actor_goals = goals, actor_cond = cond, num_rollout_steps = 4)
+    rollout = supermimic(initial_state, sim_context, actor_goals = goals, actor_cond = cond, num_rollout_timesteps = 4)
 
     assert rollout.states.shape == (2, 5, 71)
     assert rollout.actions.shape == (2, 4, 29)
@@ -185,9 +185,10 @@ def test_actor_rollout(
 
     assert torch.allclose(rollout.states[:, 0], initial_state)
 
-    # bptt reaches the actor through the world model
+    # bptt of actor loss reaches the actor through the world model
 
-    rollout.rewards.sum().backward()
+    actor_loss = supermimic.actor_loss(rollout.states[:, 1:].sum(dim = -1), rollout.terminals)
+    actor_loss.backward()
     assert has_grads(actor)
 
     # but the world model weights stay frozen
