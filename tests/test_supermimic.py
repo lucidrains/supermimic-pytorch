@@ -1,6 +1,5 @@
 import torch
 from torch import nn
-import torch.nn.functional as F
 
 import pytest
 param = pytest.mark.parametrize
@@ -34,10 +33,11 @@ def test_humanoid_actor_forward():
     [
         (dict(), True, ('state',), False),
         (dict(dim_hiddens = (16,), pred_reward = True), True, ('state', 'terminal', 'reward'), False),
+        (dict(dim_hiddens = (16, 16), normed_mlp = True, pred_reward = True), True, ('state', 'terminal', 'reward'), False),
         (dict(dim_sim_context = 0, dim_hiddens = (16,)), False, (), False),
         (dict(dim_hiddens = (16,)), True, (), True)
     ],
-    ids = ['default', 'terminal-and-reward', 'no-sim-context', 'residual-state-init']
+    ids = ['default', 'terminal-and-reward', 'normed-mlp', 'no-sim-context', 'residual-state-init']
 )
 def test_world_model(
     world_model_kwargs,
@@ -195,34 +195,55 @@ def test_actor_rollout(
 
     assert torch.allclose(rollout.states[:, 0], initial_state)
 
-    # bptt of actor loss reaches the actor through the world model
+    # actor loss bptt through frozen world model (critic bootstrap at s_H)
 
     rewards = rollout.states[:, 1:].sum(dim = -1)
-    bootstrap_value = None
+    final_state = final_goal = None
 
     if use_critic:
-        with torch.no_grad():
-            target_values = critic(rollout.states, goals, sim_context)
-
-        returns = Critic.calc_returns(rewards, target_values, rollout.terminals)
-        assert returns.shape == (2, 4)
-
-        critic_loss = critic(
-            rollout.states[:, :-1].detach(),
-            goals[:, :-1] if exists(goals) else None,
-            sim_context,
-            returns = returns
+        critic_loss = supermimic.critic_loss(
+            rollout.states,
+            rewards,
+            rollout.terminals,
+            goals = goals,
+            sim_context = sim_context
         )
         critic_loss.backward()
         assert has_grads(critic)
+        critic.zero_grad()
 
-        bootstrap_value = target_values[:, -1]
+        final_state = rollout.states[:, -1]
+        final_goal = goals[:, -1] if exists(goals) else None
 
-    actor_loss = supermimic.actor_loss(rewards, rollout.terminals, bootstrap_value = bootstrap_value)
+        # bootstrap flows into actor through frozen critic, even with zero rewards
+
+        zero_rewards = torch.zeros_like(rewards)
+        bootstrap_only_loss = supermimic.actor_loss(
+            zero_rewards,
+            rollout.terminals,
+            final_state = final_state,
+            final_goal = final_goal,
+            sim_context = sim_context
+        )
+        bootstrap_only_loss.backward(retain_graph = True)
+
+        assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in actor.parameters())
+        assert not has_grads(critic)
+        actor.zero_grad()
+
+    actor_loss = supermimic.actor_loss(
+        rewards,
+        rollout.terminals,
+        final_state = final_state,
+        final_goal = final_goal,
+        sim_context = sim_context
+    )
     actor_loss.backward()
     assert has_grads(actor)
 
-    # but the world model weights stay frozen
+    # world model and critic stay frozen during actor backward
 
     assert not has_grads(world_model)
 
+    if use_critic:
+        assert not has_grads(critic)

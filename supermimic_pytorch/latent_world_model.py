@@ -3,7 +3,7 @@ from collections import namedtuple
 
 import torch
 from torch import Tensor
-from torch.nn import Module, Linear
+from torch.nn import Module, Linear, GELU
 import torch.nn.functional as F
 
 from einops import rearrange
@@ -43,10 +43,12 @@ class LatentWorldModel(Module):
         dim_sim_context = 33,
         dim_latent = 128,
         dim_hiddens = (2048, 2048, 2048),
+        activation: Module = GELU(),
         normed_mlp = False,
         pred_residual_latent = True,
         pred_terminal = True,
         pred_reward = False,
+        terminal_init_bias = -4.,
         state_loss_weight = 1.,
         latent_loss_weight = 1.,
         recon_loss_weight = 1.,
@@ -60,8 +62,7 @@ class LatentWorldModel(Module):
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
-        # state <-> latent autoencoder, frozen and eval for now
-        # gradients still flow through it, so the actor can be trained through the world model
+        # state <-> latent autoencoder (frozen, gradients still flow for actor bptt)
 
         self.state_encoder = state_encoder
         self.state_decoder = state_decoder
@@ -72,7 +73,7 @@ class LatentWorldModel(Module):
             freeze(self.state_encoder).eval()
             freeze(self.state_decoder).eval()
 
-        # ema target encoder -> next latent target, meaningful once the encoder is unfrozen
+        # ema target encoder -> next latent target
 
         self.target_state_encoder = EMA(
             self.state_encoder,
@@ -89,14 +90,14 @@ class LatentWorldModel(Module):
 
         dim_in = dim_latent + dim_action + dim_sim_context
 
-        self.transition_mlp = mlp_klass(dim_in, *dim_hiddens)
+        self.transition_mlp = mlp_klass(dim_in, *dim_hiddens, activation = activation, activate_last = True)
 
         # predictions
 
         dim_embed = last(dim_hiddens)
-        self.to_latent_pred = Linear(dim_embed, dim_latent, bias = False)
-        self.to_reward_pred = Linear(dim_embed, 1, bias = False) if pred_reward else None
-        self.to_terminal_pred = Linear(dim_embed, 1, bias = False) if pred_terminal else None
+        self.to_latent_pred = Linear(dim_embed, dim_latent)
+        self.to_reward_pred = Linear(dim_embed, 1) if pred_reward else None
+        self.to_terminal_pred = Linear(dim_embed, 1) if pred_terminal else None
 
         self.pred_reward = pred_reward
         self.pred_terminal = pred_terminal
@@ -105,6 +106,10 @@ class LatentWorldModel(Module):
 
         if pred_residual_latent:
             torch.nn.init.zeros_(self.to_latent_pred.weight)
+            torch.nn.init.zeros_(self.to_latent_pred.bias)
+
+        if exists(self.to_terminal_pred):
+            torch.nn.init.constant_(self.to_terminal_pred.bias, terminal_init_bias)
 
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_latent = pred_residual_latent
@@ -173,7 +178,7 @@ class LatentWorldModel(Module):
         all_losses = []
         total_loss = 0.
 
-        # rollout across timesteps in latent space
+        # latent rollout
 
         for time_index in range(num_steps):
             action = actions[:, time_index]
@@ -214,6 +219,9 @@ class LatentWorldModel(Module):
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
+        assert action.ndim == 2, 'use `rollout` for a rollout loss'
+        assert self.has_sim_context == exists(sim_context)
+
         embed = self.transition_mlp(compact(latent, action, sim_context))
 
         pred_latent = self.to_latent_pred(embed)
@@ -230,16 +238,15 @@ class LatentWorldModel(Module):
         pred_reward = None
 
         if exists(self.to_reward_pred):
-            pred_reward = self.to_reward_pred(embed)
-            pred_reward = rearrange(pred_reward, '... 1 -> ...')
+            pred_reward = rearrange(self.to_reward_pred(embed), '... 1 -> ...')
 
         # maybe terminal
 
-        pred_terminal = None
+        pred_terminal_logit = pred_terminal = None
 
         if exists(self.to_terminal_pred):
-            pred_terminal = self.to_terminal_pred(embed)
-            pred_terminal = rearrange(pred_terminal, '... 1 -> ...')
+            pred_terminal_logit = rearrange(self.to_terminal_pred(embed), '... 1 -> ...')
+            pred_terminal = pred_terminal_logit.sigmoid()
 
         # outputs
 
@@ -263,7 +270,7 @@ class LatentWorldModel(Module):
 
             total_loss = total_loss + state_loss * self.state_loss_weight + latent_loss * self.latent_loss_weight
 
-            # e2e -> keep the unfrozen autoencoder honest
+            # e2e recon, keeps the unfrozen autoencoder honest
 
             if self.has_recon_loss:
                 recon_loss = F.mse_loss(next_state, self.decode(self.encode(next_state)))
@@ -276,7 +283,7 @@ class LatentWorldModel(Module):
 
         if exists(next_terminal):
             assert exists(pred_terminal)
-            terminal_loss = binary_cross_entropy_with_logits(pred_terminal, next_terminal)
+            terminal_loss = binary_cross_entropy_with_logits(pred_terminal_logit, next_terminal)
             total_loss = total_loss + terminal_loss * self.terminal_loss_weight
 
         losses = Losses(state_loss, latent_loss, recon_loss, terminal_loss, reward_loss)
@@ -292,9 +299,6 @@ class LatentWorldModel(Module):
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
-        assert action.ndim == 2, 'use `rollout` for a rollout loss'
-        assert self.has_sim_context == exists(sim_context)
-
         latent = self.encode(state)
 
         return self.forward_from_latent(

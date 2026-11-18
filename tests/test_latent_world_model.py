@@ -50,6 +50,7 @@ def test_latent_world_model():
 
     assert pred.state.shape == (3, 71)
     assert pred.latent.shape == (3, 8)
+    assert ((0. < pred.terminal) & (pred.terminal < 1.)).all()
 
     assert not world_model.has_recon_loss
     assert torch.allclose(loss, losses.state + losses.latent + losses.terminal + losses.reward)
@@ -74,16 +75,25 @@ def test_latent_world_model():
     assert has_grads(world_model.state_encoder)
     assert has_grads(world_model.state_decoder)
 
-    # actor still trains through the frozen world model
+    # actor still trains through frozen world model in latent space
 
     world_model.zero_grad()
 
     actor = MLP(71, 16, 29, activation = nn.GELU())
     supermimic = SuperMimic(actor = actor, world_model = world_model)
 
-    rollout = supermimic(torch.randn(2, 71), torch.randn(2, 33), num_rollout_timesteps = 2)
+    initial_state = torch.randn(2, 71)
+    sim_context = torch.randn(2, 33)
 
-    rollout.rewards.sum().backward()
+    rollout = supermimic(initial_state, sim_context, num_rollout_timesteps = 2)
+
+    with torch.no_grad():
+        _, preds, _ = world_model.rollout(initial_state, rollout.actions, rollout.states[:, 1:], sim_context)
+
+    assert torch.allclose(rollout.states[:, -1], preds[-1].state)
+
+    actor_loss = supermimic.actor_loss(rollout.rewards, rollout.terminals)
+    actor_loss.backward()
 
     assert has_grads(actor)
     assert not has_grads(world_model)

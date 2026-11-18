@@ -184,10 +184,12 @@ class WorldModel(Module):
         dim_action = 29,
         dim_sim_context = 33,
         dim_hiddens: tuple[int, ...] = (2048, 2048, 2048),
+        activation: Module = GELU(),
         normed_mlp = False,
         pred_residual_state = True,
         pred_terminal = True,
         pred_reward = False,
+        terminal_init_bias = -4.,
         state_loss_weight = 1.,
         reward_loss_weight = 1.,
         terminal_loss_weight = 1.
@@ -201,14 +203,14 @@ class WorldModel(Module):
 
         # backbone
 
-        self.transition_mlp = mlp_klass(dim_in, *dim_hiddens)
+        self.transition_mlp = mlp_klass(dim_in, *dim_hiddens, activation = activation, activate_last = True)
 
         # predictions
 
         dim_embed = last(dim_hiddens)
-        self.to_state_pred = Linear(dim_embed, dim_state, bias = False)
-        self.to_reward_pred = Linear(dim_embed, 1, bias = False) if pred_reward else None
-        self.to_terminal_pred = Linear(dim_embed, 1, bias = False) if pred_terminal else None
+        self.to_state_pred = Linear(dim_embed, dim_state)
+        self.to_reward_pred = Linear(dim_embed, 1) if pred_reward else None
+        self.to_terminal_pred = Linear(dim_embed, 1) if pred_terminal else None
 
         self.pred_reward = pred_reward
         self.pred_terminal = pred_terminal
@@ -217,6 +219,10 @@ class WorldModel(Module):
 
         if pred_residual_state:
             torch.nn.init.zeros_(self.to_state_pred.weight)
+            torch.nn.init.zeros_(self.to_state_pred.bias)
+
+        if exists(self.to_terminal_pred):
+            torch.nn.init.constant_(self.to_terminal_pred.bias, terminal_init_bias)
 
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_state = pred_residual_state
@@ -307,16 +313,14 @@ class WorldModel(Module):
         pred_reward = None
 
         if exists(self.to_reward_pred):
-            pred_reward = self.to_reward_pred(embed)
-            pred_reward = rearrange(pred_reward, '... 1 -> ...')
+            pred_reward = rearrange(self.to_reward_pred(embed), '... 1 -> ...')
 
         # maybe terminal
 
-        pred_terminal = None
+        pred_terminal_logit = pred_terminal = None
 
         if exists(self.to_terminal_pred):
-            pred_terminal_logit = self.to_terminal_pred(embed)
-            pred_terminal_logit = rearrange(pred_terminal_logit, '... 1 -> ...')
+            pred_terminal_logit = rearrange(self.to_terminal_pred(embed), '... 1 -> ...')
             pred_terminal = pred_terminal_logit.sigmoid()
 
         # outputs
@@ -363,7 +367,8 @@ class SuperMimic(Module):
         world_model: WorldModel | Module,
         critic: Module | None = None,
         observation_noise_scale = None,
-        discount_factor = 0.99
+        discount_factor = 0.99,
+        weight_critic_by_survival = True
     ):
         super().__init__()
 
@@ -375,6 +380,7 @@ class SuperMimic(Module):
 
         self.assoc_scan = AssocScan(reverse = True)
         self.discount_factor = discount_factor
+        self.weight_critic_by_survival = weight_critic_by_survival
 
         # observation noise for the actor
 
@@ -383,11 +389,54 @@ class SuperMimic(Module):
 
         self.register_buffer('observation_noise_scale', observation_noise_scale)
 
+    def critic_loss(
+        self,
+        states,                 # (b t + 1 d)
+        rewards,                # (b t)
+        pred_terminal,          # (b t)
+        goals = None,           # (b g) or (b t + 1 g)
+        sim_context = None,     # (b c)
+        lam = 0.95,
+        discount_factor = None,
+        weight_by_survival: bool | None = None,
+        mask = None             # (b t)
+    ):
+        assert exists(self.critic), '`critic` was not passed to `SuperMimic`'
+
+        discount_factor = default(discount_factor, self.discount_factor)
+        weight_by_survival = default(weight_by_survival, self.weight_critic_by_survival)
+
+        states, rewards, pred_terminal = states.detach(), rewards.detach(), pred_terminal.detach()
+
+        with torch.no_grad():
+            values = self.critic(states, goals, sim_context)
+            returns = Critic.calc_returns(rewards, values, pred_terminal, discount_factor = discount_factor, lam = lam)
+
+        # survival weights c_t = prod_{i < t} (1 - d_i)
+
+        if weight_by_survival:
+            survival = 1. - pred_terminal
+            survival_weights = F.pad(survival[:, :-1], (1, 0), value = 1.).cumprod(dim = -1)
+            mask = mask * survival_weights if exists(mask) else survival_weights
+
+        step_goals = goals[:, :-1] if exists(goals) and goals.ndim == 3 else goals
+
+        return self.critic(
+            states[:, :-1],
+            step_goals,
+            sim_context,
+            returns = returns,
+            mask = mask
+        )
+
     def actor_loss(
         self,
         rewards,                # (b t)
         pred_terminal,          # (b t)
         bootstrap_value = None, # (b)
+        final_state = None,     # (b d)
+        final_goal = None,      # (b g)
+        sim_context = None,     # (b c)
         discount_factor = None
     ):
         # rewards[t] = r_{t+1}, pred_terminal[t] = d_{t+1} -> aligned, as in eq (2)
@@ -401,7 +450,13 @@ class SuperMimic(Module):
 
         gates = discount_factor * (1. - pred_terminal)
 
-        # maybe append the bootstrap value, for horizons 16 or less
+        # bootstrap value from frozen critic, unless passed in
+
+        if not exists(bootstrap_value) and exists(self.critic):
+            assert exists(final_state), '`final_state` must be passed when `critic` is set'
+
+            with frozen(self.critic, eval = True):
+                bootstrap_value = self.critic(final_state, final_goal, sim_context)
 
         if exists(bootstrap_value):
             rewards, _ = pack([rewards, bootstrap_value], 'b *')
@@ -441,8 +496,11 @@ class SuperMimic(Module):
 
         has_observation_noise = exists(self.observation_noise_scale)
         actor_has_goal = exists(actor_goals)
+        is_latent_world_model = hasattr(world_model, 'encode') and hasattr(world_model, 'forward_from_latent')
 
         with frozen(world_model, eval = True):
+
+            latent = world_model.encode(state) if is_latent_world_model else None
 
             for time_index in range(num_rollout_timesteps):
 
@@ -459,7 +517,11 @@ class SuperMimic(Module):
 
                 # world model prediction
 
-                pred = world_model(state, action, sim_context)
+                if is_latent_world_model:
+                    pred = world_model.forward_from_latent(latent, action, sim_context)
+                    latent = pred.latent
+                else:
+                    pred = world_model(state, action, sim_context)
 
                 # next state
 
