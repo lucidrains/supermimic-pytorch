@@ -2,6 +2,7 @@
 from supermimic_pytorch.supermimic import (
     WorldModel,
     HumanoidActor,
+    Critic,
     SuperMimic
 )
 

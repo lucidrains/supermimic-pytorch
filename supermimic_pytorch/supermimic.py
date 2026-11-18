@@ -2,24 +2,21 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import Tensor, as_tensor
+from torch import Tensor, as_tensor, cat
 from torch.nn import Module, Linear, Sequential, Tanh, GELU, Identity
 import torch.nn.functional as F
 
 # ein equations
 
-from einops import rearrange, pack
-from torch_einops_utils import binary_cross_entropy_with_logits, frozen, uniform_like
-from torch_einops_utils.shape import size, shape
+from einops import rearrange, pack, repeat
+from torch_einops_utils import binary_cross_entropy_with_logits, frozen, masked_mean, uniform_like
+from torch_einops_utils.shape import assert_shape, size
 
 # mlps
 
 from x_mlps_pytorch import MLP, MimoMLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
-# gae for learning the critic for the horizon = 16 version, but not necessary
-
-from x_ppo import calc_gae
 from assoc_scan import AssocScan
 
 # functions
@@ -94,6 +91,84 @@ class HumanoidActor(Module):
 
         inputs = (goal, velocity_input, obs)
         return self.net(inputs, select_inputs = select_inputs)
+
+# critic
+
+class Critic(Module):
+    assoc_scan = AssocScan(reverse = True)
+
+    def __init__(
+        self,
+        *,
+        dim_state = 71,
+        dim_goal = 71,
+        dim_sim_context = 33,
+        dim_hiddens = (256, 128),
+        activation = GELU()
+    ):
+        super().__init__()
+
+        self.dim_in = dim_state + dim_goal + dim_sim_context
+        self.net = MLP(self.dim_in, *dim_hiddens, 1, activation = activation)
+
+        last_linear = self.net.layers[-1]
+        torch.nn.init.zeros_(last_linear.bias)
+        torch.nn.init.orthogonal_(last_linear.weight, gain = 0.01)
+
+    @staticmethod
+    def calc_returns(
+        rewards,                # (b n)
+        values,                 # (b n + 1)
+        pred_terminal,          # (b n)
+        discount_factor = 0.99,
+        lam = 0.95
+    ):
+        # eq 3
+
+        num_steps = size(rewards, 'b n -> n')
+
+        assert_shape(values, 'b n -> n', n = num_steps + 1)
+        assert_shape(pred_terminal, 'b n', n = num_steps)
+
+        values, next_values = values[..., :-1], values[..., 1:]
+        survival = 1. - pred_terminal
+
+        deltas = rewards + discount_factor * survival * next_values - values
+        gates = discount_factor * survival * lam
+
+        gae = Critic.assoc_scan(gates, deltas)
+        return gae + values
+
+    def forward(
+        self,
+        state,                              # (b d) or (b t d)
+        goal = None,                        # (b g) or (b t g)
+        sim_context = None,                 # (b c)
+        returns = None,                     # (b n) -> loss
+        mask = None                         # (b n)
+    ):
+        num_steps = size(state, 'b t d -> t') if state.ndim == 3 else None
+
+        def align(t):
+            if not exists(t) or not exists(num_steps) or t.ndim != 2:
+                return t
+            return repeat(t, 'b d -> b t d', t = num_steps)
+
+        x = cat(compact(state, align(goal), align(sim_context)), dim = -1)
+        assert_shape(x, '... d', d = self.dim_in)
+
+        values = rearrange(self.net(x), '... 1 -> ...')
+
+        if not exists(returns):
+            return values
+
+        loss = F.mse_loss(
+            values,
+            returns.detach(),
+            reduction = 'none'
+        )
+
+        return masked_mean(loss, mask)
 
 # world model
 
@@ -286,6 +361,7 @@ class SuperMimic(Module):
         *,
         actor: MLP | NormedMLP | Module,
         world_model: WorldModel | Module,
+        critic: Module | None = None,
         observation_noise_scale = None,
         discount_factor = 0.99
     ):
@@ -293,6 +369,7 @@ class SuperMimic(Module):
 
         self.actor = actor
         self.world_model = world_model
+        self.critic = critic
 
         # discount factor, for loss as well as gae (once critic is involved)
 

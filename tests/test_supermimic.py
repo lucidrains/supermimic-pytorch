@@ -7,7 +7,7 @@ param = pytest.mark.parametrize
 
 from x_mlps_pytorch import MLP
 
-from supermimic_pytorch.supermimic import WorldModel, SuperMimic
+from supermimic_pytorch.supermimic import WorldModel, SuperMimic, Critic
 
 def exists(v):
     return v is not None
@@ -130,10 +130,12 @@ def test_world_model_rollout():
     total_loss.backward()
     assert has_grads(world_model)
 
+@param('use_critic', (False, True))
 @param('actor_condition', (False, True))
 @param('actor_goal', (False, True))
 @param('observation_noise_scale', (None, 0.5))
 def test_actor_rollout(
+    use_critic,
     actor_condition,
     actor_goal,
     observation_noise_scale
@@ -165,9 +167,17 @@ def test_actor_rollout(
         pred_residual_state = False
     )
 
+    critic = Critic(
+        dim_state = 71,
+        dim_goal = dim_goal,
+        dim_sim_context = 33,
+        dim_hiddens = (16,)
+    ) if use_critic else None
+
     supermimic = SuperMimic(
         actor = actor,
         world_model = world_model,
+        critic = critic,
         observation_noise_scale = observation_noise_scale
     )
 
@@ -187,10 +197,32 @@ def test_actor_rollout(
 
     # bptt of actor loss reaches the actor through the world model
 
-    actor_loss = supermimic.actor_loss(rollout.states[:, 1:].sum(dim = -1), rollout.terminals)
+    rewards = rollout.states[:, 1:].sum(dim = -1)
+    bootstrap_value = None
+
+    if use_critic:
+        with torch.no_grad():
+            target_values = critic(rollout.states, goals, sim_context)
+
+        returns = Critic.calc_returns(rewards, target_values, rollout.terminals)
+        assert returns.shape == (2, 4)
+
+        critic_loss = critic(
+            rollout.states[:, :-1].detach(),
+            goals[:, :-1] if exists(goals) else None,
+            sim_context,
+            returns = returns
+        )
+        critic_loss.backward()
+        assert has_grads(critic)
+
+        bootstrap_value = target_values[:, -1]
+
+    actor_loss = supermimic.actor_loss(rewards, rollout.terminals, bootstrap_value = bootstrap_value)
     actor_loss.backward()
     assert has_grads(actor)
 
     # but the world model weights stay frozen
 
     assert not has_grads(world_model)
+

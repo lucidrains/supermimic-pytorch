@@ -1,6 +1,6 @@
 [project]
 name = "supermimic-pytorch"
-version = "0.0.14"
+version = "0.0.15"
 description = "Unofficial implementation of Supermimic, Scaling Humanoid Whole-Body Control with One Differentiable World Model"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }
@@ -30,8 +30,7 @@ dependencies = [
     "ema-pytorch>=0.8.3",
     "torch>=2.5",
     "torch-einops-utils>=0.2.8",
-    "x-mlps-pytorch>=0.6.14",
-    "x-ppo>=0.1.0"
+    "x-mlps-pytorch>=0.6.14"
 ]
 
 [project.urls]
