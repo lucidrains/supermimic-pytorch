@@ -9,7 +9,7 @@ import torch.nn.functional as F
 # ein equations
 
 from einops import rearrange, pack, repeat
-from torch_einops_utils import binary_cross_entropy_with_logits, frozen, masked_mean, uniform_like
+from torch_einops_utils import binary_cross_entropy_with_logits, freeze, frozen, masked_mean, uniform_like
 from torch_einops_utils.shape import assert_shape, size
 
 # mlps
@@ -17,6 +17,7 @@ from torch_einops_utils.shape import assert_shape, size
 from x_mlps_pytorch import MLP, MimoMLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
+from ema_pytorch import EMA
 from assoc_scan import AssocScan
 
 # functions
@@ -104,14 +105,18 @@ class Critic(Module):
         dim_goal = 71,
         dim_sim_context = 33,
         dim_hiddens = (256, 128),
-        activation = GELU()
+        activation = GELU(),
+        normed_mlp = False
     ):
         super().__init__()
 
-        self.dim_in = dim_state + dim_goal + dim_sim_context
-        self.net = MLP(self.dim_in, *dim_hiddens, 1, activation = activation)
+        mlp_klass = MLP if not normed_mlp else NormedMLP
 
-        last_linear = self.net.layers[-1]
+        self.dim_in = dim_state + dim_goal + dim_sim_context
+        self.net = mlp_klass(self.dim_in, *dim_hiddens, 1, activation = activation)
+
+        last_layer = self.net.layers[-1]
+        last_linear = last_layer[0] if normed_mlp else last_layer
         torch.nn.init.zeros_(last_linear.bias)
         torch.nn.init.orthogonal_(last_linear.weight, gain = 0.01)
 
@@ -366,6 +371,9 @@ class SuperMimic(Module):
         actor: MLP | NormedMLP | Module,
         world_model: WorldModel | Module,
         critic: Module | None = None,
+        use_ema_critic = False,
+        critic_ema_decay = 0.99,
+        critic_ema_kwargs: dict = dict(),
         observation_noise_scale = None,
         discount_factor = 0.99,
         weight_critic_by_survival = True
@@ -375,6 +383,24 @@ class SuperMimic(Module):
         self.actor = actor
         self.world_model = world_model
         self.critic = critic
+
+        # optional ema target critic
+
+        self.ema_critic = None
+
+        if use_ema_critic:
+            assert exists(critic), '`critic` must be passed when `use_ema_critic = True`'
+
+            self.ema_critic = EMA(
+                critic,
+                include_online_model = False,
+                beta = critic_ema_decay,
+                update_after_step = 0,
+                update_every = 1,
+                **critic_ema_kwargs
+            )
+
+            freeze(self.ema_critic.ema_model).eval()
 
         # discount factor, for loss as well as gae (once critic is involved)
 
@@ -388,6 +414,25 @@ class SuperMimic(Module):
             observation_noise_scale = as_tensor(observation_noise_scale)
 
         self.register_buffer('observation_noise_scale', observation_noise_scale)
+
+    def train(self, mode = True):
+        super().train(mode)
+
+        if exists(self.ema_critic):
+            self.ema_critic.ema_model.eval()
+
+        return self
+
+    @property
+    def target_critic(self):
+        return self.ema_critic.ema_model if exists(self.ema_critic) else self.critic
+
+    @torch.no_grad()
+    def update_ema(self):
+        if exists(self.ema_critic):
+            self.ema_critic.update()
+
+        return self
 
     def critic_loss(
         self,
@@ -409,7 +454,7 @@ class SuperMimic(Module):
         states, rewards, pred_terminal = states.detach(), rewards.detach(), pred_terminal.detach()
 
         with torch.no_grad():
-            values = self.critic(states, goals, sim_context)
+            values = self.target_critic(states, goals, sim_context)
             returns = Critic.calc_returns(rewards, values, pred_terminal, discount_factor = discount_factor, lam = lam)
 
         # survival weights c_t = prod_{i < t} (1 - d_i)
@@ -455,8 +500,8 @@ class SuperMimic(Module):
         if not exists(bootstrap_value) and exists(self.critic):
             assert exists(final_state), '`final_state` must be passed when `critic` is set'
 
-            with frozen(self.critic, eval = True):
-                bootstrap_value = self.critic(final_state, final_goal, sim_context)
+            with frozen(self.target_critic, eval = True):
+                bootstrap_value = self.target_critic(final_state, final_goal, sim_context)
 
         if exists(bootstrap_value):
             rewards, _ = pack([rewards, bootstrap_value], 'b *')

@@ -130,12 +130,21 @@ def test_world_model_rollout():
     total_loss.backward()
     assert has_grads(world_model)
 
-@param('use_critic', (False, True))
+@param(
+    'use_critic, use_ema_critic, critic_normed_mlp',
+    (
+        (False, False, False),
+        (True, False, False),
+        (True, True, True)
+    )
+)
 @param('actor_condition', (False, True))
 @param('actor_goal', (False, True))
 @param('observation_noise_scale', (None, 0.5))
 def test_actor_rollout(
     use_critic,
+    use_ema_critic,
+    critic_normed_mlp,
     actor_condition,
     actor_goal,
     observation_noise_scale
@@ -171,13 +180,15 @@ def test_actor_rollout(
         dim_state = 71,
         dim_goal = dim_goal,
         dim_sim_context = 33,
-        dim_hiddens = (16,)
+        dim_hiddens = (16,),
+        normed_mlp = critic_normed_mlp
     ) if use_critic else None
 
     supermimic = SuperMimic(
         actor = actor,
         world_model = world_model,
         critic = critic,
+        use_ema_critic = use_ema_critic,
         observation_noise_scale = observation_noise_scale
     )
 
@@ -211,6 +222,7 @@ def test_actor_rollout(
         critic_loss.backward()
         assert has_grads(critic)
         critic.zero_grad()
+        supermimic.update_ema()
 
         final_state = rollout.states[:, -1]
         final_goal = goals[:, -1] if exists(goals) else None
@@ -229,6 +241,7 @@ def test_actor_rollout(
 
         assert any(exists(p.grad) and p.grad.abs().sum() > 0 for p in actor.parameters())
         assert not has_grads(critic)
+        assert not has_grads(supermimic.target_critic)
         actor.zero_grad()
 
     actor_loss = supermimic.actor_loss(
@@ -247,3 +260,4 @@ def test_actor_rollout(
 
     if use_critic:
         assert not has_grads(critic)
+        assert not has_grads(supermimic.target_critic)
