@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -95,5 +96,51 @@ def test_latent_world_model():
     actor_loss = supermimic.actor_loss(rollout.rewards, rollout.terminals)
     actor_loss.backward()
 
+    assert has_grads(actor)
+    assert not has_grads(world_model)
+
+@pytest.mark.parametrize('num_discrete_actions', (4, (4, 3)))
+def test_latent_world_model_discrete_actions(num_discrete_actions):
+    action_dims = num_discrete_actions if isinstance(num_discrete_actions, tuple) else (num_discrete_actions,)
+    is_multi = len(action_dims) > 1
+
+    world_model = LatentWorldModel(
+        state_encoder = MLP(8, 16, 4),
+        state_decoder = MLP(4, 16, 8),
+        num_discrete_actions = num_discrete_actions,
+        dim_sim_context = 0,
+        dim_latent = 4,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True
+    )
+
+    state = torch.randn(3, 8)
+    per_head = [torch.randint(0, n, (3,)) for n in action_dims]
+    indices = torch.stack(per_head, dim = -1) if is_multi else per_head[0]
+    one_hot = torch.cat([torch.nn.functional.one_hot(a, n).float() for a, n in zip(per_head, action_dims)], dim = -1)
+
+    with torch.no_grad():
+        pred_idx = world_model(state, indices)
+        pred_oh = world_model(state, one_hot)
+
+    assert torch.allclose(pred_idx.state, pred_oh.state)
+    assert torch.allclose(pred_idx.latent, pred_oh.latent)
+
+    seq_per_head = [torch.randint(0, n, (3, 4)) for n in action_dims]
+    seq_indices = torch.stack(seq_per_head, dim = -1) if is_multi else seq_per_head[0]
+
+    loss, _, _ = world_model.rollout(state, seq_indices, torch.randn(3, 4, 8))
+    loss.backward()
+    assert has_grads(world_model.transition_mlp)
+
+    world_model.zero_grad()
+
+    actor = MLP(8, 16, sum(action_dims), activation = nn.GELU())
+    supermimic = SuperMimic(actor = actor, world_model = world_model)
+
+    rollout = supermimic(state, num_rollout_timesteps = 3)
+    actor_loss = supermimic.actor_loss(rollout.rewards, rollout.terminals)
+    actor_loss.backward()
     assert has_grads(actor)
     assert not has_grads(world_model)

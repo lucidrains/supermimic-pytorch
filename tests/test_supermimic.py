@@ -261,3 +261,102 @@ def test_actor_rollout(
     if use_critic:
         assert not has_grads(critic)
         assert not has_grads(supermimic.target_critic)
+
+@param('num_discrete_actions', (4, (4, 3)))
+def test_world_model_discrete_actions(num_discrete_actions):
+    world_model = WorldModel(
+        dim_state = 8,
+        num_discrete_actions = num_discrete_actions,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_residual_state = False,
+        pred_reward = True,
+        pred_terminal = True
+    )
+
+    action_dims = num_discrete_actions if isinstance(num_discrete_actions, tuple) else (num_discrete_actions,)
+    is_multi = len(action_dims) > 1
+
+    state = torch.randn(3, 8)
+    per_head = [torch.randint(0, n, (3,)) for n in action_dims]
+    indices = torch.stack(per_head, dim = -1) if is_multi else per_head[0]
+    one_hot = torch.cat([torch.nn.functional.one_hot(a, n).float() for a, n in zip(per_head, action_dims)], dim = -1)
+
+    # integer indices and one-hot produce identical predictions
+
+    with torch.no_grad():
+        pred_idx = world_model(state, indices)
+        pred_oh = world_model(state, one_hot)
+
+    assert torch.allclose(pred_idx.state, pred_oh.state)
+    assert torch.allclose(pred_idx.reward, pred_oh.reward)
+    assert torch.allclose(pred_idx.terminal, pred_oh.terminal)
+
+    # rollout with integer action sequences
+
+    seq_per_head = [torch.randint(0, n, (3, 5)) for n in action_dims]
+    seq_indices = torch.stack(seq_per_head, dim = -1) if is_multi else seq_per_head[0]
+
+    total_loss, preds, losses = world_model.rollout(
+        state,
+        seq_indices,
+        torch.randn(3, 5, 8),
+        next_terminals = torch.randint(0, 2, (3, 5)).float(),
+        next_rewards = torch.randn(3, 5)
+    )
+
+    assert len(preds) == len(losses) == 5
+    assert preds[0].state.shape == (3, 8)
+    total_loss.backward()
+    assert has_grads(world_model)
+
+    with pytest.raises(AssertionError):
+        WorldModel(dim_state = 8, dim_action = 2, num_discrete_actions = num_discrete_actions)
+
+@param('num_discrete_actions, split_actor_output', ((4, False), ((4, 3), False), ((4, 3), True)))
+def test_supermimic_discrete_bptt(num_discrete_actions, split_actor_output):
+    action_dims = num_discrete_actions if isinstance(num_discrete_actions, tuple) else (num_discrete_actions,)
+    total_dim = sum(action_dims)
+
+    world_model = WorldModel(
+        dim_state = 8,
+        num_discrete_actions = num_discrete_actions,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_residual_state = False,
+        pred_reward = True,
+        pred_terminal = True
+    )
+
+    critic = Critic(dim_state = 8, dim_goal = 0, dim_sim_context = 0, dim_hiddens = (16,))
+    mlp = MLP(8, 16, total_dim, activation = nn.GELU())
+
+    class TupleActor(nn.Module):
+        def __init__(self, net):
+            super().__init__()
+            self.net = net
+
+        def forward(self, x):
+            return self.net(x).split(action_dims, dim = -1)
+
+    actor = TupleActor(mlp) if split_actor_output else mlp
+
+    supermimic = SuperMimic(
+        actor = actor,
+        world_model = world_model,
+        critic = critic,
+        use_ema_critic = True
+    )
+
+    rollout = supermimic(torch.randn(4, 8), num_rollout_timesteps = 4)
+
+    assert rollout.states.shape == (4, 5, 8)
+    assert rollout.actions.shape == (4, 4, total_dim)
+
+    loss = supermimic.actor_loss(rollout.rewards, rollout.terminals, final_state = rollout.states[:, -1])
+    loss.backward()
+
+    assert has_grads(actor)
+    assert not has_grads(world_model)
+    assert not has_grads(critic)
+    assert not has_grads(supermimic.target_critic)

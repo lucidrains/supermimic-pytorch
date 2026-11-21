@@ -2,7 +2,7 @@ from __future__ import annotations
 from collections import namedtuple
 
 import torch
-from torch import Tensor, as_tensor, cat
+from torch import Tensor, as_tensor, cat, is_tensor
 from torch.nn import Module, Linear, Sequential, Tanh, GELU, Identity
 import torch.nn.functional as F
 
@@ -19,6 +19,7 @@ from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
 from ema_pytorch import EMA
 from assoc_scan import AssocScan
+from discrete_continuous_embed_readout import MultiCategorical
 
 # functions
 
@@ -33,6 +34,34 @@ def last(arr):
 
 def compact(*arr):
     return tuple(filter(exists, arr))
+
+def cast_tuple(v):
+    return tuple(v) if isinstance(v, (tuple, list)) else (v,)
+
+def resolve_action_dim(
+    dim_action: int | None,
+    num_discrete_actions: int | tuple[int, ...] | None,
+    default_dim_action = 29
+):
+    num_discrete_actions = cast_tuple(num_discrete_actions) if num_discrete_actions else ()
+    assert all(n > 0 for n in num_discrete_actions), 'discrete action counts must be positive'
+
+    if not num_discrete_actions:
+        return default(dim_action, default_dim_action), ()
+
+    assert not (exists(dim_action) and dim_action > 0), 'cannot specify both `dim_action` and `num_discrete_actions`'
+    return sum(num_discrete_actions), num_discrete_actions
+
+def to_one_hot(indices: Tensor, num_classes: tuple[int, ...], dtype):
+    indices = indices.long()
+
+    if len(num_classes) == 1:
+        if indices.ndim == 2 and indices.shape[-1] == 1:
+            indices = rearrange(indices, 'b 1 -> b')
+        return F.one_hot(indices, num_classes[0]).to(dtype)
+
+    assert indices.ndim >= 2 and indices.shape[-1] == len(num_classes)
+    return cat([F.one_hot(i, n) for i, n in zip(indices.unbind(dim = -1), num_classes)], dim = -1).to(dtype)
 
 # actor
 
@@ -186,7 +215,8 @@ class WorldModel(Module):
         self,
         *,
         dim_state = 71,
-        dim_action = 29,
+        dim_action: int | None = None,
+        num_discrete_actions: int | tuple[int, ...] | None = None,
         dim_sim_context = 33,
         dim_hiddens: tuple[int, ...] = (2048, 2048, 2048),
         activation: Module = GELU(),
@@ -201,6 +231,9 @@ class WorldModel(Module):
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
+
+        dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
+        self.has_discrete_actions = len(self.num_discrete_actions) > 0
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
@@ -290,12 +323,15 @@ class WorldModel(Module):
     def forward(
         self,
         state,                                  # (b dim_state)
-        action,                                 # (b dim_action)
+        action,                                 # (b dim_action) or discrete indices
         sim_context: Tensor | None = None,      # (b dim_sim_context)
         next_state: Tensor | None = None,
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
+        if self.has_discrete_actions and not action.is_floating_point():
+            action = to_one_hot(action, self.num_discrete_actions, state.dtype)
+
         assert action.ndim == 2, 'use `rollout` for a rollout loss'
         assert self.has_sim_context == exists(sim_context)
 
@@ -376,13 +412,20 @@ class SuperMimic(Module):
         critic_ema_kwargs: dict = dict(),
         observation_noise_scale = None,
         discount_factor = 0.99,
-        weight_critic_by_survival = True
+        weight_critic_by_survival = True,
+        discrete_action_temperature = 1.
     ):
         super().__init__()
 
         self.actor = actor
         self.world_model = world_model
         self.critic = critic
+
+        self.num_discrete_actions = getattr(world_model, 'num_discrete_actions', ())
+        self.has_discrete_actions = len(self.num_discrete_actions) > 0
+
+        assert discrete_action_temperature > 0.
+        self.discrete_action_temperature = discrete_action_temperature
 
         # optional ema target critic
 
@@ -559,6 +602,15 @@ class SuperMimic(Module):
                 actor_goal = actor_goals[:, time_index] if actor_has_goal else None
 
                 action = actor(compact(obs, actor_goal, actor_cond))
+
+                if self.has_discrete_actions:
+                    if is_tensor(action) and len(self.num_discrete_actions) > 1:
+                        action = action.split(self.num_discrete_actions, dim = -1)
+
+                    action = MultiCategorical(action).sample(
+                        temperature = self.discrete_action_temperature,
+                        differentiable = True
+                    )
 
                 # world model prediction
 

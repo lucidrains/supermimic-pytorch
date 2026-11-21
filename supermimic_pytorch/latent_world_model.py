@@ -14,6 +14,8 @@ from torch_einops_utils.shape import size
 from x_mlps_pytorch import MLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
+from supermimic_pytorch.supermimic import resolve_action_dim, to_one_hot
+
 # helpers
 
 def exists(v):
@@ -39,7 +41,8 @@ class LatentWorldModel(Module):
         *,
         state_encoder: Module,
         state_decoder: Module,
-        dim_action = 29,
+        dim_action: int | None = None,
+        num_discrete_actions: int | tuple[int, ...] | None = None,
         dim_sim_context = 33,
         dim_latent = 128,
         dim_hiddens = (2048, 2048, 2048),
@@ -59,6 +62,9 @@ class LatentWorldModel(Module):
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
+
+        dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
+        self.has_discrete_actions = len(self.num_discrete_actions) > 0
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
@@ -219,6 +225,9 @@ class LatentWorldModel(Module):
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
+        if self.has_discrete_actions and not action.is_floating_point():
+            action = to_one_hot(action, self.num_discrete_actions, latent.dtype)
+
         assert action.ndim == 2, 'use `rollout` for a rollout loss'
         assert self.has_sim_context == exists(sim_context)
 

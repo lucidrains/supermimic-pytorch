@@ -4,6 +4,7 @@
 #     "supermimic-pytorch",
 #     "memmap-replay-buffer>=0.3.0",
 #     "mean-conc-beta>=0.2.11",
+#     "discrete-continuous-embed-readout>=0.2.12",
 #     "gymnasium[box2d]",
 #     "ema-pytorch>=0.8.3",
 #     "einops>=0.8.1",
@@ -43,6 +44,7 @@ from einops import rearrange
 from torch_einops_utils import temp_eval
 from ema_pytorch import EMA
 from mean_conc_beta import Beta
+from discrete_continuous_embed_readout import MultiCategorical
 from memmap_replay_buffer import StreamReplayBuffer
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
@@ -52,6 +54,9 @@ from supermimic_pytorch import WorldModel, Critic, SuperMimic
 
 def exists(v):
     return v is not None
+
+def default(v, d):
+    return v if exists(v) else d
 
 def divisible_by(num, den):
     return (num % den) == 0
@@ -88,9 +93,49 @@ class Actor(Module):
     def entropy(self, state):
         return self.beta.entropy(self.params(state))
 
+    def act(self, state):
+        return self(state).cpu().numpy()
+
     def forward(self, state):
         params = self.params(state)
         return self.beta.rsample(params) if self.training else self.beta.mean(params)
+
+class DiscreteActor(Module):
+    def __init__(
+        self,
+        dim_state: int,
+        num_actions: int,
+        dim_hidden = 256,
+        depth = 3,
+        action_noise = 0.05
+    ):
+        super().__init__()
+        self.num_actions = num_actions
+        self.action_noise = action_noise
+        self.net = NormedMLP(dim_state, *([dim_hidden] * depth), num_actions, activation = SiLU())
+
+        last_linear = self.net.layers[-1][0]
+        init.orthogonal_(last_linear.weight, gain = 0.01)
+        init.zeros_(last_linear.bias)
+
+    def dist(self, state):
+        return MultiCategorical(self.net(state))
+
+    def entropy(self, state):
+        return self.dist(state).entropy()
+
+    def act(self, state):
+        actions = self.dist(state).sample(temperature = 0.)
+
+        if self.training and self.action_noise > 0.:
+            noise_mask = torch.rand(actions.shape, device = actions.device) < self.action_noise
+            random_actions = torch.randint_like(actions, self.num_actions)
+            actions = torch.where(noise_mask, random_actions, actions)
+
+        return actions.cpu().numpy()
+
+    def forward(self, state):
+        return self.net(state)
 
 # evaluation and trajectory gif recording
 
@@ -117,7 +162,7 @@ def evaluate(
     with temp_eval(actor), torch.no_grad():
         while not dones.all():
             active = ~dones
-            actions = actor(as_tensor(states[active], device = device)).cpu().numpy()
+            actions = actor.act(as_tensor(states[active], device = device))
 
             for k, env_index in enumerate(np.flatnonzero(active)):
                 next_state, reward, terminated, truncated, _ = envs[env_index].step(actions[k])
@@ -141,7 +186,13 @@ def evaluate(
 
     return float(scores.mean()), float(scores.std())
 
-def save_returns_plot(train_returns: list[float], eval_steps: list[int], eval_means: list[float], out_path: Path):
+def save_returns_plot(
+    train_returns: list[float],
+    eval_steps: list[int],
+    eval_means: list[float],
+    out_path: Path,
+    title: str = 'LunarLanderContinuous-v3 — SuperMimic'
+):
     fig, ax = plt.subplots(figsize = (8.5, 4.5), dpi = 150)
 
     if len(train_returns) >= 50:
@@ -155,7 +206,7 @@ def save_returns_plot(train_returns: list[float], eval_steps: list[int], eval_me
     ax.axhline(200., color = '#16a34a', linestyle = '--', linewidth = 1.3, label = 'Solved (200+)')
     ax.set_xlabel('Environment Steps (×1,000)')
     ax.set_ylabel('Return')
-    ax.set_title('LunarLanderContinuous-v3 — SuperMimic')
+    ax.set_title(title)
     ax.grid(True, alpha = 0.25)
     ax.legend(loc = 'lower right')
     fig.tight_layout()
@@ -165,8 +216,9 @@ def save_returns_plot(train_returns: list[float], eval_steps: list[int], eval_me
 # main training
 
 def main(
-    env_name = 'LunarLanderContinuous-v3',
-    out_dir = './results_lunar',
+    continuous = True,
+    env_name: str | None = None,
+    out_dir: str | None = None,
     seed = 42,
     num_envs = 16,
     buffer_capacity = 48_000,
@@ -199,6 +251,8 @@ def main(
     state_loss_weight = 150.,
     discount_factor = 0.993,
     entropy_weight = 2e-3,
+    discrete_temperature = 1.,
+    discrete_action_noise = 0.05,
     rolling_window = 50,
     target_return: float | None = 250.,
     eval_every = 25,
@@ -208,26 +262,36 @@ def main(
     np.random.seed(seed)
 
     device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
-    out_path = Path(out_dir)
-    out_path.mkdir(parents = True, exist_ok = True)
 
     # environments
 
+    env_name = default(env_name, 'LunarLanderContinuous-v3' if continuous else 'LunarLander-v3')
     envs = [gym.make(env_name) for _ in range(num_envs)]
     env_states = [env.reset(seed = seed + i)[0] for i, env in enumerate(envs)]
 
+    is_discrete = isinstance(envs[0].action_space, gym.spaces.Discrete)
     dim_state = int(envs[0].observation_space.shape[0])
-    dim_action = int(envs[0].action_space.shape[0])
-    action_low, action_high = envs[0].action_space.low, envs[0].action_space.high
+
+    out_dir = default(out_dir, './results_lunar_discrete' if is_discrete else './results_lunar')
+    out_path = Path(out_dir)
+    out_path.mkdir(parents = True, exist_ok = True)
 
     # models
 
-    actor = Actor(dim_state, dim_action, bounds = np.stack((action_low, action_high), axis = -1)).to(device)
+    if is_discrete:
+        num_actions, dim_action = int(envs[0].action_space.n), None
+        actor = DiscreteActor(dim_state, num_actions, action_noise = discrete_action_noise).to(device)
+    else:
+        num_actions, dim_action = None, int(envs[0].action_space.shape[0])
+        action_low, action_high = envs[0].action_space.low, envs[0].action_space.high
+        actor = Actor(dim_state, dim_action, bounds = np.stack((action_low, action_high), axis = -1)).to(device)
+
     ema_actor = EMA(actor, beta = ema_decay, include_online_model = False, update_after_step = 0, update_every = 1).to(device)
 
     world_model = WorldModel(
         dim_state = dim_state,
         dim_action = dim_action,
+        num_discrete_actions = num_actions,
         dim_sim_context = 0,
         dim_hiddens = (256, 256, 256),
         activation = SiLU(),
@@ -254,7 +318,8 @@ def main(
         use_ema_critic = use_ema_critic,
         critic_ema_decay = critic_ema_decay,
         observation_noise_scale = observation_noise_scale,
-        discount_factor = discount_factor
+        discount_factor = discount_factor,
+        discrete_action_temperature = discrete_temperature
     ).to(device)
 
     # optimizers
@@ -272,7 +337,7 @@ def main(
         capacity = buffer_capacity,
         fields = dict(
             state = ('float', dim_state),
-            action = ('float', dim_action),
+            action = 'int' if is_discrete else ('float', dim_action),
             next_state = ('float', dim_state),
             reward = 'float',
             terminal = 'float',
@@ -300,7 +365,7 @@ def main(
             states_tensor = as_tensor(np.asarray(env_states, dtype = np.float32), device = device)
 
             with torch.no_grad():
-                actions = np.array([env.action_space.sample() for env in envs]) if random_actions else actor(states_tensor).cpu().numpy()
+                actions = np.array([env.action_space.sample() for env in envs]) if random_actions else actor.act(states_tensor)
 
             for env_index, env in enumerate(envs):
                 next_state, reward, terminated, truncated, _ = env.step(actions[env_index])
@@ -320,7 +385,7 @@ def main(
                         buffer.store_step(
                             env_index,
                             state = next_state,
-                            action = np.random.uniform(action_low, action_high).astype(np.float32),
+                            action = env.action_space.sample(),
                             next_state = next_state,
                             reward = 0.,
                             terminal = 1.,
@@ -455,7 +520,7 @@ def main(
             print(f'iter {iteration:4d} | steps {total_env_steps:6d} | train{rolling_window} {rolling_mean:6.1f} | eval {eval_mean:6.1f} ± {eval_std:5.1f}', flush = True)
 
             torch.save(ema_actor.ema_model.state_dict(), out_path / 'actor.pt')
-            save_returns_plot(train_returns, eval_steps, eval_means, out_path / 'returns.png')
+            save_returns_plot(train_returns, eval_steps, eval_means, out_path / 'returns.png', title = f'{env_name} — SuperMimic')
 
             if exists(target_return) and eval_mean >= target_return:
                 print(f'reached eval return {eval_mean:.1f} >= {target_return:.1f} at iter {iteration}, stopping early', flush = True)
