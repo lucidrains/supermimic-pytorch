@@ -2,6 +2,7 @@
 # requires-python = ">= 3.10"
 # dependencies = [
 #     "supermimic-pytorch",
+#     "memmap-replay-buffer>=0.3.0",
 #     "mean-conc-beta>=0.2.11",
 #     "gymnasium[box2d]",
 #     "ema-pytorch>=0.8.3",
@@ -32,16 +33,17 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 import torch
-from torch import Tensor, as_tensor, arange, cat, full, randint, tensor, zeros
+from torch import as_tensor, cat, tensor
 from torch.nn import Module, SiLU, init
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from einops import rearrange, repeat
-from torch_einops_utils import temp_eval, tree_map_tensor_to_device
+from einops import rearrange
+from torch_einops_utils import temp_eval
 from ema_pytorch import EMA
 from mean_conc_beta import Beta
+from memmap_replay_buffer import StreamReplayBuffer
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
 from supermimic_pytorch import WorldModel, Critic, SuperMimic
@@ -89,141 +91,6 @@ class Actor(Module):
     def forward(self, state):
         params = self.params(state)
         return self.beta.rsample(params) if self.training else self.beta.mean(params)
-
-# replay buffer
-
-class ReplayBuffer:
-    def __init__(
-        self,
-        num_envs: int,
-        capacity: int,
-        dim_state: int,
-        dim_action: int,
-        action_low,
-        action_high,
-        absorbing_steps = 7
-    ):
-        shape = (num_envs, capacity)
-        self.capacity = capacity
-        self.absorbing_steps = absorbing_steps
-        self.action_low = action_low
-        self.action_high = action_high
-
-        self.states = zeros((*shape, dim_state))
-        self.actions = zeros((*shape, dim_action))
-        self.next_states = zeros((*shape, dim_state))
-        self.rewards = zeros(shape)
-        self.terminals = zeros(shape)
-        self.episode_ids = full(shape, -1, dtype = torch.long)
-        self.is_real = zeros(shape, dtype = torch.bool)
-
-        self.write_ptrs = [0] * num_envs
-        self.is_full = False
-        self.current_episode_ids = list(range(num_envs))
-        self.next_episode_id = num_envs
-
-    def write(self, env_index: int, state, action, next_state, reward: float, terminal: float, is_real = True):
-        ptr = self.write_ptrs[env_index]
-
-        self.states[env_index, ptr] = as_tensor(state, dtype = torch.float32)
-        self.actions[env_index, ptr] = as_tensor(action, dtype = torch.float32)
-        self.next_states[env_index, ptr] = as_tensor(next_state, dtype = torch.float32)
-        self.rewards[env_index, ptr] = reward
-        self.terminals[env_index, ptr] = terminal
-        self.episode_ids[env_index, ptr] = self.current_episode_ids[env_index]
-        self.is_real[env_index, ptr] = is_real
-
-        self.is_full = self.is_full or (ptr + 1 >= self.capacity)
-        self.write_ptrs[env_index] = (ptr + 1) % self.capacity
-
-    def add(self, env_index: int, state, action, next_state, reward: float, terminated: bool, truncated: bool):
-        self.write(env_index, state, action, next_state, float(reward), float(terminated), is_real = True)
-
-        if terminated:
-            for _ in range(self.absorbing_steps):
-                random_action = np.random.uniform(self.action_low, self.action_high).astype(np.float32)
-                self.write(env_index, next_state, random_action, next_state, 0., 1., is_real = False)
-
-        if terminated or truncated:
-            self.current_episode_ids[env_index] = self.next_episode_id
-            self.next_episode_id += 1
-
-    def active_length(self, pad = 20):
-        max_ptr = max(self.write_ptrs)
-        return self.capacity if (self.is_full or max_ptr + pad >= self.capacity) else max(max_ptr, pad)
-
-    def reward_rms(self, device):
-        real_rewards = self.rewards[self.is_real]
-        if real_rewards.numel() < 64:
-            return tensor(1., device = device)
-
-        return real_rewards.square().mean().sqrt().clamp(min = 1e-2).to(device)
-
-    def sample_indices(self, valid_mask: Tensor, num_samples: int, recent_window = 4_000, recent_frac = 0.35):
-        length = valid_mask.shape[1]
-        age = (tensor(self.write_ptrs)[:, None] - 1 - arange(length)[None, :]) % self.capacity
-
-        all_envs, all_times = valid_mask.nonzero(as_tuple = True)
-        recent_envs, recent_times = (valid_mask & (age < recent_window)).nonzero(as_tuple = True)
-
-        if recent_envs.numel() == 0:
-            recent_envs, recent_times = all_envs, all_times
-
-        num_recent = int(num_samples * recent_frac)
-        recent_pick = randint(0, recent_envs.numel(), (num_recent,))
-        all_pick = randint(0, all_envs.numel(), (num_samples - num_recent,))
-
-        return cat((recent_envs[recent_pick], all_envs[all_pick])), cat((recent_times[recent_pick], all_times[all_pick]))
-
-    def valid_window_mask(self, horizon: int):
-        length = self.active_length(horizon + 2)
-        times = arange(length)
-        age = (tensor(self.write_ptrs)[:, None] - 1 - times[None, :]) % self.capacity
-        end_times = (times + horizon - 1) % self.capacity
-
-        same_episode = (self.episode_ids[:, :length] >= 0) & (self.episode_ids[:, :length] == self.episode_ids[:, end_times])
-        return same_episode & (age >= horizon - 1), age
-
-    def sample_sequences(self, batch_size: int, horizon: int, device, max_age: int | None = None):
-        valid_mask, age = self.valid_window_mask(horizon)
-
-        if exists(max_age):
-            recent_mask = valid_mask & (age < max_age)
-            candidate_envs, candidate_times = (recent_mask if recent_mask.any() else valid_mask).nonzero(as_tuple = True)
-            pick = randint(0, candidate_envs.numel(), (batch_size,))
-            env_indices, start_times = candidate_envs[pick], candidate_times[pick]
-        else:
-            env_indices, start_times = self.sample_indices(valid_mask, batch_size)
-
-        time_offsets = (start_times[:, None] + arange(horizon)[None, :]) % self.capacity
-        env_grid = repeat(env_indices, 'b -> b t', t = horizon)
-
-        final_next_state = self.next_states[env_indices, (start_times + horizon - 1) % self.capacity]
-        states = cat((self.states[env_grid, time_offsets], rearrange(final_next_state, 'b d -> b 1 d')), dim = 1)
-
-        return tree_map_tensor_to_device((
-            states,
-            self.actions[env_grid, time_offsets],
-            self.next_states[env_grid, time_offsets],
-            self.terminals[env_grid, time_offsets],
-            self.rewards[env_grid, time_offsets]
-        ), device)
-
-    def sample_states(self, batch_size: int, device):
-        env_indices, time_indices = self.sample_indices(self.is_real[:, :self.active_length()], batch_size)
-        return self.states[env_indices, time_indices].to(device)
-
-    def sample_terminals(self, batch_size: int, device, min_age = 600):
-        length = self.active_length()
-        age = (tensor(self.write_ptrs)[:, None] - 1 - arange(length)[None, :]) % self.capacity
-        term_envs, term_times = (self.is_real[:, :length] & (self.terminals[:, :length] > 0.5) & (age >= min_age)).nonzero(as_tuple = True)
-
-        if term_envs.numel() == 0:
-            return None
-
-        pick = randint(0, term_envs.numel(), (batch_size,))
-        env_indices, time_indices = term_envs[pick], term_times[pick]
-        return tree_map_tensor_to_device((self.states[env_indices, time_indices], self.rewards[env_indices, time_indices]), device)
 
 # evaluation and trajectory gif recording
 
@@ -303,6 +170,9 @@ def main(
     seed = 42,
     num_envs = 16,
     buffer_capacity = 48_000,
+    memmap = True,
+    recent_window = 4_000,
+    recent_frac = 0.35,
     num_iterations = 1_500,
     env_steps_per_iter = 16,
     warmup_steps_per_env = 320,
@@ -394,9 +264,27 @@ def main(
     actor_scheduler = CosineAnnealingLR(actor_opt, T_max = num_iterations, eta_min = actor_lr * 0.2)
     critic_opt = AdamW(critic.parameters(), lr = critic_lr, weight_decay = weight_decay)
 
-    # replay state
+    # replay buffer
 
-    buffer = ReplayBuffer(num_envs, buffer_capacity, dim_state, dim_action, action_low, action_high, absorbing_steps = wm_horizon - 1)
+    buffer = StreamReplayBuffer(
+        folder = out_path / 'replay' if memmap else None,
+        num_streams = num_envs,
+        capacity = buffer_capacity,
+        fields = dict(
+            state = ('float', dim_state),
+            action = ('float', dim_action),
+            next_state = ('float', dim_state),
+            reward = 'float',
+            terminal = 'float',
+            is_real = ('bool', (), False)
+        )
+    )
+
+    absorbing_steps = wm_horizon - 1
+    real_only = dict(is_real = True)
+    real_terminals = dict(is_real = True, terminal = lambda x: x > 0.5)
+    recent_mixture = [(recent_frac, dict(max_age = recent_window)), (1. - recent_frac, dict())]
+
     running_returns = np.zeros(num_envs)
     train_returns, recent_returns = [], deque(maxlen = rolling_window)
     eval_steps, eval_means = [], []
@@ -416,12 +304,34 @@ def main(
 
             for env_index, env in enumerate(envs):
                 next_state, reward, terminated, truncated, _ = env.step(actions[env_index])
-                buffer.add(env_index, env_states[env_index], actions[env_index], next_state, reward, terminated, truncated)
+
+                buffer.store_step(
+                    env_index,
+                    state = env_states[env_index],
+                    action = actions[env_index],
+                    next_state = next_state,
+                    reward = float(reward),
+                    terminal = float(terminated),
+                    is_real = True
+                )
+
+                if terminated:
+                    for _ in range(absorbing_steps):
+                        buffer.store_step(
+                            env_index,
+                            state = next_state,
+                            action = np.random.uniform(action_low, action_high).astype(np.float32),
+                            next_state = next_state,
+                            reward = 0.,
+                            terminal = 1.,
+                            is_real = False
+                        )
 
                 total_env_steps += 1
                 running_returns[env_index] += reward
 
                 if terminated or truncated:
+                    buffer.end_episode(env_index)
                     episode_return = float(running_returns[env_index])
                     train_returns.append(episode_return)
                     recent_returns.append(episode_return)
@@ -433,17 +343,24 @@ def main(
     # world model update helper
 
     def update_world_model(num_updates: int):
-        reward_scale = buffer.reward_rms(device)
+        r_stats = buffer.field_stats('reward', filter_fields = real_only)
+        reward_scale = tensor(max(r_stats.rms, 1e-2) if r_stats.count >= 64 else 1., dtype = torch.float32, device = device)
 
         for _ in range(num_updates):
-            states, actions, next_states, next_terminals, next_rewards = buffer.sample_sequences(batch_size, wm_horizon, device)
+            batch = buffer.sample(
+                batch_size,
+                horizon = wm_horizon,
+                mixture = recent_mixture,
+                to_named_tuple = ('state', 'action', 'next_state', 'terminal', 'reward'),
+                device = device
+            )
 
             wm_loss, _, _ = world_model.rollout(
-                states[:, 0],
-                actions,
-                next_states,
-                next_terminals = next_terminals,
-                next_rewards = next_rewards / reward_scale
+                batch.state[:, 0],
+                batch.action,
+                batch.next_state,
+                next_terminals = batch.terminal,
+                next_rewards = batch.reward / reward_scale
             )
 
             world_model_opt.zero_grad()
@@ -468,14 +385,30 @@ def main(
         # update critic on real replay sequences
 
         for _ in range(critic_updates_per_iter):
-            critic_states, _, _, critic_terminals, critic_rewards = buffer.sample_sequences(batch_size, critic_horizon, device, max_age = critic_max_age)
-            critic_loss = supermimic.critic_loss(critic_states, critic_rewards / reward_scale, critic_terminals, lam = gae_lam)
+            batch = buffer.sample(
+                batch_size,
+                horizon = critic_horizon,
+                max_age = critic_max_age,
+                fallback_on_empty = True,
+                to_named_tuple = ('state', 'last_next_state', 'terminal', 'reward'),
+                device = device
+            )
+
+            critic_states = cat((batch.state, rearrange(batch.last_next_state, 'b d -> b 1 d')), dim = 1)
+            critic_loss = supermimic.critic_loss(critic_states, batch.reward / reward_scale, batch.terminal, lam = gae_lam)
 
             if terminal_anchor_weight > 0.:
-                terminal_batch = buffer.sample_terminals(terminal_batch_size, device, min_age = critic_max_age)
-                if exists(terminal_batch):
-                    term_states, term_rewards = terminal_batch
-                    critic_loss = critic_loss + terminal_anchor_weight * critic(term_states, returns = term_rewards / reward_scale)
+                term = buffer.sample(
+                    terminal_batch_size,
+                    min_age = critic_max_age,
+                    filter_fields = real_terminals,
+                    allow_empty = True,
+                    to_named_tuple = ('state', 'reward'),
+                    device = device
+                )
+
+                if exists(term):
+                    critic_loss = critic_loss + terminal_anchor_weight * critic(term.state, returns = term.reward / reward_scale)
 
             critic_opt.zero_grad()
             critic_loss.backward()
@@ -485,7 +418,14 @@ def main(
 
         # imagine rollout through frozen world model and update actor via bptt
 
-        initial_states = buffer.sample_states(batch_size, device)
+        initial_states = buffer.sample(
+            batch_size,
+            filter_fields = real_only,
+            mixture = recent_mixture,
+            fields = ('state',),
+            device = device
+        )['state']
+
         rollout = supermimic(initial_states, num_rollout_timesteps = imagination_horizon)
 
         entropy = actor.entropy(rollout.states[:, :-1].detach()).mean()
