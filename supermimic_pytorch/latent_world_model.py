@@ -14,12 +14,21 @@ from torch_einops_utils.shape import size
 from x_mlps_pytorch import MLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
-from supermimic_pytorch.supermimic import resolve_action_dim, to_one_hot
+from supermimic_pytorch.supermimic import (
+    State,
+    flatten_state,
+    flatten_state_with_inverse,
+    resolve_action_dim,
+    to_one_hot
+)
 
 # helpers
 
 def exists(v):
     return v is not None
+
+def identity(t):
+    return t
 
 def last(arr):
     return arr[-1]
@@ -148,15 +157,15 @@ class LatentWorldModel(Module):
         unfreeze(self.state_decoder).train()
         return self
 
-    def encode(self, state):
-        return self.state_encoder(state)
+    def encode(self, state: State):
+        return self.state_encoder(flatten_state(state))
 
     def decode(self, latent):
         return self.state_decoder(latent)
 
     @torch.no_grad()
-    def encode_target(self, state):
-        return self.target_state_encoder(state)
+    def encode_target(self, state: State):
+        return self.target_state_encoder(flatten_state(state))
 
     @torch.no_grad()
     def update_ema(self):
@@ -167,14 +176,17 @@ class LatentWorldModel(Module):
 
     def rollout(
         self,
-        state,
+        state: State,
         actions,                                 # (b time dim_action)
-        next_states: Tensor,                     # (b time dim_state)
+        next_states: State,                      # (b time dim_state)
         sim_context: Tensor | None = None,       # (b dim_sim_context)
         next_terminals: Tensor | None = None,    # (b time ...)
         next_rewards: Tensor | None = None       # (b time ...)
     ):
         num_steps = size(actions, 'b [t] ...')
+
+        state, inverse_state = flatten_state_with_inverse(state)
+        next_states = flatten_state(next_states, match = inverse_state)
 
         latent = self.encode(state)
 
@@ -209,7 +221,7 @@ class LatentWorldModel(Module):
 
             total_loss = total_loss + loss
 
-            all_preds.append(pred)
+            all_preds.append(pred._replace(state = inverse_state(pred.state)))
             all_losses.append(losses)
 
             latent = pred.latent # feed predicted latent back in
@@ -221,9 +233,10 @@ class LatentWorldModel(Module):
         latent,
         action,
         sim_context: Tensor | None = None,
-        next_state: Tensor | None = None,
+        next_state: State | None = None,
         next_terminal: Tensor | None = None,
-        next_reward: Tensor | None = None
+        next_reward: Tensor | None = None,
+        inverse_state = None
     ):
         if self.has_discrete_actions and not action.is_floating_point():
             action = to_one_hot(action, self.num_discrete_actions, latent.dtype)
@@ -257,9 +270,18 @@ class LatentWorldModel(Module):
             pred_terminal_logit = rearrange(self.to_terminal_pred(embed), '... 1 -> ...')
             pred_terminal = pred_terminal_logit.sigmoid()
 
+        # maybe flatten next_state
+
+        inverse_next_state = None
+
+        if exists(next_state):
+            next_state, inverse_next_state = flatten_state_with_inverse(next_state, match = inverse_state)
+
+        reconstitute = inverse_state or inverse_next_state or identity
+
         # outputs
 
-        pred = Predictions(pred_next_state, pred_latent, pred_terminal, pred_reward)
+        pred = Predictions(reconstitute(pred_next_state), pred_latent, pred_terminal, pred_reward)
 
         # maybe loss
 
@@ -301,13 +323,14 @@ class LatentWorldModel(Module):
 
     def forward(
         self,
-        state,                                  # (b dim_state)
+        state: State,                           # (b dim_state)
         action,                                 # (b dim_action)
         sim_context: Tensor | None = None,      # (b dim_sim_context)
-        next_state: Tensor | None = None,
+        next_state: State | None = None,
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
+        state, inverse_state = flatten_state_with_inverse(state)
         latent = self.encode(state)
 
         return self.forward_from_latent(
@@ -316,5 +339,6 @@ class LatentWorldModel(Module):
             sim_context,
             next_state,
             next_terminal,
-            next_reward
+            next_reward,
+            inverse_state = inverse_state
         )

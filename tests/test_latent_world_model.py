@@ -4,9 +4,10 @@ from torch import nn
 
 from ema_pytorch import EMA
 from x_mlps_pytorch import MLP
+from torch_einops_utils import tree_map_tensor
 
 from supermimic_pytorch.latent_world_model import LatentWorldModel
-from supermimic_pytorch.supermimic import SuperMimic
+from supermimic_pytorch.supermimic import SuperMimic, flatten_state
 
 def exists(v):
     return v is not None
@@ -144,3 +145,94 @@ def test_latent_world_model_discrete_actions(num_discrete_actions):
     actor_loss.backward()
     assert has_grads(actor)
     assert not has_grads(world_model)
+
+def test_latent_world_model_dict_state():
+    dim_total = 71 + 93
+
+    def make_state(*prefix):
+        return {
+            'state': torch.randn(*prefix, 71),
+            'observation': {
+                'joint_pos': torch.randn(*prefix, 29),
+                'joint_vel': torch.randn(*prefix, 29),
+                'base_ang_vel': torch.randn(*prefix, 3),
+                'projected_gravity': torch.randn(*prefix, 3),
+                'prev_action': torch.randn(*prefix, 29)
+            }
+        }
+
+    world_model = LatentWorldModel(
+        state_encoder = nn.Sequential(MLP(dim_total, 16, 8), nn.Tanh()),
+        state_decoder = MLP(8, 16, dim_total),
+        dim_latent = 8,
+        dim_hiddens = (16,),
+        pred_reward = True
+    )
+
+    state = make_state(3)
+    next_state = make_state(3)
+    action = torch.randn(3, 29)
+    sim_context = torch.randn(3, 33)
+
+    # inference & training with nested dict state
+
+    pred_only = world_model(state, action, sim_context)
+    assert isinstance(pred_only.state, dict)
+    assert pred_only.state['state'].shape == (3, 71)
+    assert pred_only.state['observation']['joint_pos'].shape == (3, 29)
+
+    loss, pred, losses = world_model(state, action, sim_context, next_state)
+    assert isinstance(pred.state, dict)
+    assert pred.state['observation']['projected_gravity'].shape == (3, 3)
+
+    loss_flat, _, _ = world_model(flatten_state(state), action, sim_context, flatten_state(next_state))
+    assert torch.allclose(loss, loss_flat)
+
+    loss.backward()
+    assert has_grads(world_model.transition_mlp)
+    world_model.zero_grad()
+
+    # direct forward_from_latent with dict next_state reconstitutes pred.state
+
+    latent = world_model.encode(state)
+    _, pred_from_latent, _ = world_model.forward_from_latent(latent, action, sim_context, next_state)
+    assert isinstance(pred_from_latent.state, dict)
+    assert pred_from_latent.state['observation']['joint_vel'].shape == (3, 29)
+
+    # rollout & SuperMimic BPTT with nested dict state
+
+    actor = MLP(dim_total, 16, 29, activation = nn.GELU())
+    supermimic = SuperMimic(actor = actor, world_model = world_model)
+
+    initial_state = make_state(2)
+    sim_ctx = torch.randn(2, 33)
+
+    rollout = supermimic(initial_state, sim_ctx, num_rollout_timesteps = 3)
+    assert isinstance(rollout.states, dict)
+    assert rollout.states['state'].shape == (2, 4, 71)
+    assert rollout.states['observation']['joint_pos'].shape == (2, 4, 29)
+
+    next_states = tree_map_tensor(lambda t: t[:, 1:], rollout.states)
+
+    with torch.no_grad():
+        _, preds, _ = world_model.rollout(initial_state, rollout.actions, next_states, sim_ctx)
+
+    assert isinstance(preds[-1].state, dict)
+    assert torch.allclose(rollout.states['state'][:, -1], preds[-1].state['state'])
+    assert torch.allclose(
+        rollout.states['observation']['joint_pos'][:, -1],
+        preds[-1].state['observation']['joint_pos']
+    )
+
+    rewards = -rollout.states['observation']['joint_pos'][:, 1:].square().mean(dim = -1)
+    actor_loss = supermimic.actor_loss(rewards, rollout.terminals)
+    actor_loss.backward()
+
+    assert has_grads(actor)
+    assert not has_grads(world_model)
+
+    # mismatched schema raises
+
+    swapped = {'observation': next_state['observation'], 'state': next_state['state']}
+    with pytest.raises(AssertionError):
+        world_model(state, action, sim_context, swapped)

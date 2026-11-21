@@ -9,7 +9,7 @@ import torch.nn.functional as F
 # ein equations
 
 from einops import rearrange, pack, repeat
-from torch_einops_utils import binary_cross_entropy_with_logits, freeze, frozen, masked_mean, uniform_like
+from torch_einops_utils import binary_cross_entropy_with_logits, freeze, frozen, masked_mean, tree_flatten_with_inverse, uniform_like
 from torch_einops_utils.shape import assert_shape, size
 
 # mlps
@@ -29,6 +29,9 @@ def exists(v):
 def default(v, d):
     return v if exists(v) else d
 
+def identity(t):
+    return t
+
 def last(arr):
     return arr[-1]
 
@@ -37,6 +40,45 @@ def compact(*arr):
 
 def cast_tuple(v):
     return tuple(v) if isinstance(v, (tuple, list)) else (v,)
+
+# state helpers (Tensor, dict[Name, Tensor], or nested dict)
+
+Name = str
+State = Tensor | dict[Name, 'State']
+
+def state_schema(state: State):
+    if is_tensor(state):
+        assert state.ndim > 0, 'state leaves must have at least 1 dimension'
+        return state.shape[-1]
+
+    assert isinstance(state, dict) and len(state) > 0, 'state must be a Tensor or non-empty dict'
+    assert all(isinstance(k, str) for k in state.keys()), 'state dict keys must be str'
+
+    return tuple((k, state_schema(v)) for k, v in state.items())
+
+def flatten_state_with_inverse(state: State, match = None):
+    schema = None if is_tensor(state) else state_schema(state)
+
+    if exists(match):
+        expected = getattr(match, 'schema', None) if callable(match) else match
+        assert expected == schema, 'state dict structure mismatch'
+
+    if is_tensor(state):
+        return state, identity
+
+    tensors, unflatten = tree_flatten_with_inverse(state)
+    dims = [t.shape[-1] for t in tensors]
+
+    def inverse(t: Tensor):
+        return unflatten(t.split(dims, dim = -1))
+
+    inverse.schema = schema
+
+    return cat(tensors, dim = -1), inverse
+
+def flatten_state(state: State, match = None):
+    flat, _ = flatten_state_with_inverse(state, match = match)
+    return flat
 
 def resolve_action_dim(
     dim_action: int | None,
@@ -104,15 +146,15 @@ class HumanoidActor(Module):
 
     def forward(
         self,
-        obs,                                # (b num_obs_frames dim_obs)
-        goal = None,                        # (b num_goal_frames dim_goal)
+        obs: State,                         # (b num_obs_frames dim_obs)
+        goal: State | None = None,          # (b num_goal_frames dim_goal)
         command = None                      # (b dim_command) normalized velocity command
     ):
         is_motion = exists(goal)
         assert is_motion != exists(command), 'pass either goal or command'
 
-        obs = rearrange(obs, 'b h d -> b (h d)')
-        goal = rearrange(goal, 'b k d -> b (k d)') if is_motion else None
+        obs = rearrange(flatten_state(obs), 'b h d -> b (h d)')
+        goal = rearrange(flatten_state(goal), 'b k d -> b (k d)') if is_motion else None
 
         velocity_input = (command, obs) if not is_motion else None
         select_inputs = (0 if is_motion else 1, 2)
@@ -175,12 +217,14 @@ class Critic(Module):
 
     def forward(
         self,
-        state,                              # (b d) or (b t d)
+        state: State,                       # (b d) or (b t d)
         goal = None,                        # (b g) or (b t g)
         sim_context = None,                 # (b c)
         returns = None,                     # (b n) -> loss
         mask = None                         # (b n)
     ):
+        state = flatten_state(state)
+
         num_steps = size(state, 'b t d -> t') if state.ndim == 3 else None
 
         def align(t):
@@ -273,14 +317,17 @@ class WorldModel(Module):
 
     def rollout(
         self,
-        state,
+        state: State,
         actions,                                 # (b time dim_action)
-        next_states: Tensor,                     # (b time ...)
+        next_states: State,                      # (b time ...)
         sim_context: Tensor | None = None,       # (b dim_sim_context)
         next_terminals: Tensor | None = None,    # (b time ...)
         next_rewards: Tensor | None = None       # (b time ...)
     ):
         num_steps = size(actions, 'b [t] ...')
+
+        state, inverse_state = flatten_state_with_inverse(state)
+        next_states = flatten_state(next_states, match = inverse_state)
 
         # accumulants
 
@@ -313,7 +360,7 @@ class WorldModel(Module):
 
             total_loss = total_loss + loss
 
-            all_preds.append(pred)
+            all_preds.append(pred._replace(state = inverse_state(pred.state)))
             all_losses.append(losses)
 
             state = pred.state # feed prediction back in
@@ -322,13 +369,15 @@ class WorldModel(Module):
 
     def forward(
         self,
-        state,                                  # (b dim_state)
+        state: State,                           # (b dim_state)
         action,                                 # (b dim_action) or discrete indices
         sim_context: Tensor | None = None,      # (b dim_sim_context)
-        next_state: Tensor | None = None,
+        next_state: State | None = None,
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None
     ):
+        state, inverse_state = flatten_state_with_inverse(state)
+
         if self.has_discrete_actions and not action.is_floating_point():
             action = to_one_hot(action, self.num_discrete_actions, state.dtype)
 
@@ -366,7 +415,7 @@ class WorldModel(Module):
 
         # outputs
 
-        pred = Predictions(pred_next_state, pred_terminal, pred_reward)
+        pred = Predictions(inverse_state(pred_next_state), pred_terminal, pred_reward)
 
         # maybe loss
 
@@ -379,6 +428,7 @@ class WorldModel(Module):
         state_loss = reward_loss = terminal_loss = None
 
         if exists(next_state):
+            next_state = flatten_state(next_state, match = inverse_state)
             state_loss = F.mse_loss(next_state, pred_next_state)
             total_loss = total_loss + state_loss * self.state_loss_weight
 
@@ -453,7 +503,13 @@ class SuperMimic(Module):
 
         # observation noise for the actor
 
+        self.observation_noise_schema = None
+
         if exists(observation_noise_scale):
+            if isinstance(observation_noise_scale, dict):
+                observation_noise_scale, inverse_noise = flatten_state_with_inverse(observation_noise_scale)
+                self.observation_noise_schema = inverse_noise.schema
+
             observation_noise_scale = as_tensor(observation_noise_scale)
 
         self.register_buffer('observation_noise_scale', observation_noise_scale)
@@ -479,7 +535,7 @@ class SuperMimic(Module):
 
     def critic_loss(
         self,
-        states,                 # (b t + 1 d)
+        states: State,          # (b t + 1 d)
         rewards,                # (b t)
         pred_terminal,          # (b t)
         goals = None,           # (b g) or (b t + 1 g)
@@ -494,6 +550,7 @@ class SuperMimic(Module):
         discount_factor = default(discount_factor, self.discount_factor)
         weight_by_survival = default(weight_by_survival, self.weight_critic_by_survival)
 
+        states = flatten_state(states)
         states, rewards, pred_terminal = states.detach(), rewards.detach(), pred_terminal.detach()
 
         with torch.no_grad():
@@ -522,7 +579,7 @@ class SuperMimic(Module):
         rewards,                # (b t)
         pred_terminal,          # (b t)
         bootstrap_value = None, # (b)
-        final_state = None,     # (b d)
+        final_state: State | None = None,     # (b d)
         final_goal = None,      # (b g)
         sim_context = None,     # (b c)
         discount_factor = None
@@ -542,6 +599,8 @@ class SuperMimic(Module):
 
         if not exists(bootstrap_value) and exists(self.critic):
             assert exists(final_state), '`final_state` must be passed when `critic` is set'
+
+            final_state = flatten_state(final_state)
 
             with frozen(self.target_critic, eval = True):
                 bootstrap_value = self.target_critic(final_state, final_goal, sim_context)
@@ -563,7 +622,7 @@ class SuperMimic(Module):
 
     def forward(
         self,
-        initial_state,
+        initial_state: State,
         sim_context: Tensor | None = None,
         actor_goals: Tensor | None = None,
         actor_cond: Tensor | None = None,
@@ -572,6 +631,10 @@ class SuperMimic(Module):
         actor, world_model = self.actor, self.world_model
 
         pred_reward, pred_terminal = self.world_model.pred_reward, self.world_model.pred_terminal
+
+        # maybe flatten dict state
+
+        initial_state, inverse_state = flatten_state_with_inverse(initial_state, match = self.observation_noise_schema)
 
         # rollout actor within the world model
 
@@ -635,7 +698,7 @@ class SuperMimic(Module):
 
         # return all intermediates
 
-        states = rearrange(states, 't b ... -> b t ...')
+        states = inverse_state(rearrange(states, 't b ... -> b t ...'))
         actions = rearrange(actions, 't b ... -> b t ...')
 
         rewards = rearrange(rewards, 't b -> b t') if pred_reward else None
