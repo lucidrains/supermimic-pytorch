@@ -1,15 +1,17 @@
 from __future__ import annotations
 from collections import namedtuple
+from typing import Callable
 
 import torch
 from torch import Tensor, as_tensor, cat, is_tensor
 from torch.nn import Module, Linear, Sequential, Tanh, GELU, Identity
 import torch.nn.functional as F
+from torch.utils._pytree import tree_map
 
 # ein equations
 
 from einops import rearrange, pack, repeat
-from torch_einops_utils import binary_cross_entropy_with_logits, freeze, frozen, masked_mean, tree_flatten_with_inverse, uniform_like
+from torch_einops_utils import binary_cross_entropy_with_logits, freeze, frozen, masked_mean, tree_flatten_with_inverse, tree_map_tensor, uniform_like
 from torch_einops_utils.shape import assert_shape, size
 
 # mlps
@@ -20,6 +22,11 @@ from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 from ema_pytorch import EMA
 from assoc_scan import AssocScan
 from discrete_continuous_embed_readout import MultiCategorical
+
+from supermimic_pytorch.history import (
+    HistoryWindow,
+    action_smoothness_penalty
+)
 
 # functions
 
@@ -80,6 +87,41 @@ def flatten_state(state: State, match = None):
     flat, _ = flatten_state_with_inverse(state, match = match)
     return flat
 
+def flatten_window(x: State | None) -> Tensor | None:
+    if not exists(x):
+        return None
+    flat = flatten_state(x)
+    return rearrange(flat, '... w d -> ... (w d)') if flat.ndim >= 3 else flat
+
+def select_key(state: State, key: str | tuple[str, ...]) -> State:
+    out = state
+    for k in cast_tuple(key):
+        assert isinstance(out, dict) and k in out, f'key {k!r} not found in state dict'
+        out = out[k]
+    return out
+
+def add_observation_noise(obs: State, scale) -> State:
+    if not exists(scale):
+        return obs
+
+    def add_noise(tensor, noise_scale):
+        if not exists(noise_scale):
+            return tensor
+
+        if is_tensor(noise_scale):
+            noise_scale = noise_scale.to(device = tensor.device, dtype = tensor.dtype)
+
+        return tensor + uniform_like(tensor, noise_scale)
+
+    if isinstance(scale, dict) or is_tensor(obs):
+        return tree_map(add_noise, obs, scale)
+
+    if is_tensor(scale) and scale.ndim > 0:
+        flat, inverse = flatten_state_with_inverse(obs)
+        return inverse(add_noise(flat, scale))
+
+    return tree_map_tensor(lambda tensor: add_noise(tensor, scale), obs)
+
 def resolve_action_dim(
     dim_action: int | None,
     num_discrete_actions: int | tuple[int, ...] | None,
@@ -110,6 +152,8 @@ def to_one_hot(indices: Tensor, num_classes: tuple[int, ...], dtype):
 class HumanoidActor(Module):
     """unitree humanoid actor"""
 
+    structured_input = True
+
     def __init__(
         self,
         *,
@@ -118,6 +162,7 @@ class HumanoidActor(Module):
         dim_goal = 71,
         dim_command = 3,
         num_obs_frames = 10,
+        num_action_frames = 0,
         num_goal_frames = 10,
         dim_latent = 32,
         dim_hiddens = (2048, 1024, 512, 256),
@@ -126,18 +171,20 @@ class HumanoidActor(Module):
     ):
         super().__init__()
 
+        dim_obs_history = num_obs_frames * dim_obs + num_action_frames * dim_action
+
         motion_encoder = Sequential(
             MLP(num_goal_frames * dim_goal, *dim_hiddens, dim_latent, activation = activation),
             Tanh()
         )
 
         velocity_encoder = Sequential(
-            MLP(dim_command + num_obs_frames * dim_obs, *dim_velocity_hiddens, dim_latent, activation = activation),
+            MLP(dim_command + dim_obs_history, *dim_velocity_hiddens, dim_latent, activation = activation),
             Tanh()
         )
 
         self.net = MimoMLP(
-            dim_latent + num_obs_frames * dim_obs,
+            dim_latent + dim_obs_history,
             *dim_hiddens,
             dim_action,
             inputs = (motion_encoder, velocity_encoder, Identity()),
@@ -146,15 +193,20 @@ class HumanoidActor(Module):
 
     def forward(
         self,
-        obs: State,                         # (b num_obs_frames dim_obs)
-        goal: State | None = None,          # (b num_goal_frames dim_goal)
-        command = None                      # (b dim_command) normalized velocity command
+        obs: State,                         # (... num_obs_frames dim_obs) or nested dict
+        goal: State | None = None,          # (... num_goal_frames dim_goal)
+        command = None,                     # (... dim_command) normalized velocity command
+        past_action: Tensor | None = None   # (... num_action_frames dim_action)
     ):
         is_motion = exists(goal)
         assert is_motion != exists(command), 'pass either goal or command'
 
-        obs = rearrange(flatten_state(obs), 'b h d -> b (h d)')
-        goal = rearrange(flatten_state(goal), 'b k d -> b (k d)') if is_motion else None
+        obs = flatten_window(obs)
+
+        if exists(past_action):
+            obs = cat((obs, flatten_window(past_action)), dim = -1)
+
+        goal = flatten_window(goal) if is_motion else None
 
         velocity_input = (command, obs) if not is_motion else None
         select_inputs = (0 if is_motion else 1, 2)
@@ -277,6 +329,7 @@ class WorldModel(Module):
         assert len(dim_hiddens) > 0
 
         dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
+        self.dim_action = dim_action
         self.has_discrete_actions = len(self.num_discrete_actions) > 0
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
@@ -461,21 +514,42 @@ class SuperMimic(Module):
         critic_ema_decay = 0.99,
         critic_ema_kwargs: dict = dict(),
         observation_noise_scale = None,
+        actor_obs_key: str | tuple[str, ...] | None = None,
+        state_to_obs: Callable[[State, Tensor | None], State] | None = None,
+        critic_state_key: str | tuple[str, ...] | None = None,
+        obs_history: HistoryWindow | int | None = None,
+        action_history: HistoryWindow | int | None = None,
+        goal_window: HistoryWindow | int | None = None,
+        action_smoothness_weight: float = 0.,
         discount_factor = 0.99,
         weight_critic_by_survival = True,
         discrete_action_temperature = 1.
     ):
         super().__init__()
+        assert not (exists(actor_obs_key) and exists(state_to_obs)), 'pass either `actor_obs_key` or `state_to_obs`'
 
         self.actor = actor
         self.world_model = world_model
         self.critic = critic
 
+        self.dim_action = getattr(world_model, 'dim_action', None)
         self.num_discrete_actions = getattr(world_model, 'num_discrete_actions', ())
         self.has_discrete_actions = len(self.num_discrete_actions) > 0
 
         assert discrete_action_temperature > 0.
         self.discrete_action_temperature = discrete_action_temperature
+
+        # asymmetric selectors, unfold history windows & smoothness
+
+        self.actor_obs_key = actor_obs_key
+        self.state_to_obs = state_to_obs
+        self.critic_state_key = critic_state_key
+
+        self.obs_history = (HistoryWindow(obs_history) if obs_history > 0 else None) if isinstance(obs_history, int) else obs_history
+        self.action_history = (HistoryWindow(action_history, self.dim_action, lag = 1) if action_history > 0 else None) if isinstance(action_history, int) else action_history
+        self.goal_window = (HistoryWindow(goal_window, future = True, pad_mode = 'replicate') if goal_window > 0 else None) if isinstance(goal_window, int) else goal_window
+
+        self.action_smoothness_weight = action_smoothness_weight
 
         # optional ema target critic
 
@@ -504,13 +578,22 @@ class SuperMimic(Module):
         # observation noise for the actor
 
         self.observation_noise_schema = None
+        self.observation_noise_dict = None
 
         if exists(observation_noise_scale):
             if isinstance(observation_noise_scale, dict):
-                observation_noise_scale, inverse_noise = flatten_state_with_inverse(observation_noise_scale)
-                self.observation_noise_schema = inverse_noise.schema
+                leaves = tree_flatten_with_inverse(observation_noise_scale)[0]
+                can_flatten_state = not (exists(actor_obs_key) or exists(state_to_obs)) and all(is_tensor(t) and t.ndim > 0 for t in leaves)
 
-            observation_noise_scale = as_tensor(observation_noise_scale)
+                if can_flatten_state:
+                    observation_noise_scale, inverse_noise = flatten_state_with_inverse(observation_noise_scale)
+                    self.observation_noise_schema = inverse_noise.schema
+                    observation_noise_scale = as_tensor(observation_noise_scale)
+                else:
+                    self.observation_noise_dict = observation_noise_scale
+                    observation_noise_scale = None
+            else:
+                observation_noise_scale = as_tensor(observation_noise_scale)
 
         self.register_buffer('observation_noise_scale', observation_noise_scale)
 
@@ -550,8 +633,16 @@ class SuperMimic(Module):
         discount_factor = default(discount_factor, self.discount_factor)
         weight_by_survival = default(weight_by_survival, self.weight_critic_by_survival)
 
+        if exists(self.critic_state_key):
+            states = select_key(states, self.critic_state_key)
+
         states = flatten_state(states)
         states, rewards, pred_terminal = states.detach(), rewards.detach(), pred_terminal.detach()
+
+        if exists(goals):
+            goals = flatten_state(goals)
+            if goals.ndim == 3 and goals.shape[1] > states.shape[1]:
+                goals = goals[:, :states.shape[1]]
 
         with torch.no_grad():
             values = self.target_critic(states, goals, sim_context)
@@ -582,11 +673,22 @@ class SuperMimic(Module):
         final_state: State | None = None,     # (b d)
         final_goal = None,      # (b g)
         sim_context = None,     # (b c)
+        actions: State | None = None,         # (b t d_a)
+        past_actions: State | None = None,    # (b d_a) or (b p d_a)
+        past_mask: Tensor | None = None,      # (b p) or (b,)
+        action_smoothness_weight: float | None = None,
         discount_factor = None
     ):
         # rewards[t] = r_{t+1}, pred_terminal[t] = d_{t+1} -> aligned, as in eq (2)
 
         assert size(pred_terminal, 'b [t]') == size(rewards, 'b [t]')
+
+        smoothness_weight = default(action_smoothness_weight, self.action_smoothness_weight)
+        if smoothness_weight > 0.:
+            assert exists(actions), '`actions` required when `action_smoothness_weight > 0`'
+            rewards = rewards - smoothness_weight * action_smoothness_penalty(
+                actions, past_actions, past_mask = past_mask
+            )
 
         # following eq (2) in the paper
         # rewards are derived analytically from world model next state predictions, actions, mocap related references
@@ -600,7 +702,11 @@ class SuperMimic(Module):
         if not exists(bootstrap_value) and exists(self.critic):
             assert exists(final_state), '`final_state` must be passed when `critic` is set'
 
+            if exists(self.critic_state_key):
+                final_state = select_key(final_state, self.critic_state_key)
+
             final_state = flatten_state(final_state)
+            final_goal = flatten_state(final_goal) if exists(final_goal) else None
 
             with frozen(self.target_critic, eval = True):
                 bootstrap_value = self.target_critic(final_state, final_goal, sim_context)
@@ -624,8 +730,11 @@ class SuperMimic(Module):
         self,
         initial_state: State,
         sim_context: Tensor | None = None,
-        actor_goals: Tensor | None = None,
+        actor_goals: State | None = None,
         actor_cond: Tensor | None = None,
+        past_obs: State | None = None,
+        past_actions: Tensor | None = None,
+        past_mask: Tensor | None = None,
         num_rollout_timesteps = 32
     ):
         actor, world_model = self.actor, self.world_model
@@ -635,6 +744,27 @@ class SuperMimic(Module):
         # maybe flatten dict state
 
         initial_state, inverse_state = flatten_state_with_inverse(initial_state, match = self.observation_noise_schema)
+        batch_size = size(initial_state, 'b d -> b')
+        device, dtype = initial_state.device, initial_state.dtype
+
+        # maybe unfold future goal windows & init rolling caches
+
+        actor_has_goal = exists(actor_goals)
+
+        if actor_has_goal and exists(self.goal_window):
+            actor_goals = tree_map_tensor(lambda t: t[:, :num_rollout_timesteps], self.goal_window(actor_goals))
+
+        obs_cache = act_cache = None
+
+        if exists(self.obs_history) and exists(past_obs):
+            _, obs_cache = self.obs_history.step(past_obs, mask = past_mask)
+
+        if exists(self.action_history):
+            if exists(past_actions) and self.has_discrete_actions and not past_actions.is_floating_point():
+                past_actions = to_one_hot(past_actions, self.num_discrete_actions, dtype)
+            _, act_cache = self.action_history.step(
+                past_actions, mask = past_mask, batch_shape = (batch_size, self.dim_action), device = device, dtype = dtype
+            )
 
         # rollout actor within the world model
 
@@ -645,8 +775,8 @@ class SuperMimic(Module):
 
         state = initial_state
 
-        has_observation_noise = exists(self.observation_noise_scale)
-        actor_has_goal = exists(actor_goals)
+        obs_noise = default(self.observation_noise_dict, self.observation_noise_scale)
+        structured = getattr(actor, 'structured_input', False)
         is_latent_world_model = hasattr(world_model, 'encode') and hasattr(world_model, 'forward_from_latent')
 
         with frozen(world_model, eval = True):
@@ -657,14 +787,34 @@ class SuperMimic(Module):
 
                 # actor forward
 
-                obs = state
+                obs = inverse_state(state)
 
-                if has_observation_noise:
-                    obs = state + uniform_like(state, self.observation_noise_scale)
+                if exists(self.state_to_obs):
+                    obs = self.state_to_obs(obs, sim_context)
+                elif exists(self.actor_obs_key):
+                    obs = select_key(obs, self.actor_obs_key)
 
-                actor_goal = actor_goals[:, time_index] if actor_has_goal else None
+                obs = add_observation_noise(obs, obs_noise)
 
-                action = actor(compact(obs, actor_goal, actor_cond))
+                if exists(self.obs_history):
+                    obs, obs_cache = self.obs_history.step(obs, obs_cache)
+
+                past_action = None
+                if exists(self.action_history):
+                    past_action, _ = self.action_history.step(cache = act_cache)
+
+                actor_goal = tree_map_tensor(lambda t: t[:, time_index], actor_goals) if actor_has_goal else None
+
+                if structured:
+                    action = actor(obs, goal = actor_goal, command = actor_cond, past_action = past_action)
+                else:
+                    actor_inputs = compact(
+                        flatten_window(obs),
+                        flatten_window(past_action),
+                        flatten_window(actor_goal),
+                        flatten_window(actor_cond)
+                    )
+                    action = actor(actor_inputs)
 
                 if self.has_discrete_actions:
                     if is_tensor(action) and len(self.num_discrete_actions) > 1:
@@ -674,6 +824,9 @@ class SuperMimic(Module):
                         temperature = self.discrete_action_temperature,
                         differentiable = True
                     )
+
+                if exists(self.action_history):
+                    _, act_cache = self.action_history.step(action, act_cache)
 
                 # world model prediction
 

@@ -73,6 +73,7 @@ class LatentWorldModel(Module):
         assert len(dim_hiddens) > 0
 
         dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
+        self.dim_action = dim_action
         self.has_discrete_actions = len(self.num_discrete_actions) > 0
 
         mlp_klass = MLP if not normed_mlp else NormedMLP

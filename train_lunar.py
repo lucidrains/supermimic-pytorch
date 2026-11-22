@@ -36,19 +36,20 @@ import matplotlib.pyplot as plt
 import torch
 from torch import as_tensor, cat, tensor
 from torch.nn import Module, SiLU, init
+import torch.nn.functional as F
 from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from einops import rearrange
-from torch_einops_utils import temp_eval
+from torch_einops_utils import pad_right_at_dim, temp_eval
 from ema_pytorch import EMA
 from mean_conc_beta import Beta
 from discrete_continuous_embed_readout import MultiCategorical
 from memmap_replay_buffer import StreamReplayBuffer
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
-from supermimic_pytorch import WorldModel, Critic, SuperMimic
+from supermimic_pytorch import WorldModel, Critic, SuperMimic, HistoryWindow
 
 # helpers
 
@@ -63,6 +64,57 @@ def divisible_by(num, den):
 
 # actor
 
+def init_history(actor, dim_state, dim_action, obs_window, action_window, pad_mode, per_slot_pad):
+    actor.obs_history = HistoryWindow(obs_window, dim_state, pad_mode = pad_mode, per_slot_pad = per_slot_pad) if obs_window > 1 else None
+    actor.action_history = HistoryWindow(action_window, dim_action, lag = 1, pad_mode = pad_mode, per_slot_pad = per_slot_pad) if action_window > 0 else None
+    dim_obs = actor.obs_history.dim_out if exists(actor.obs_history) else dim_state
+    dim_act = actor.action_history.dim_out if exists(actor.action_history) else 0
+    return dim_obs + dim_act
+
+def encode_history(actor, states, actions = None, past_obs = None, past_actions = None, past_mask = None):
+    obs = rearrange(actor.obs_history(states, past = past_obs, past_mask = past_mask), 'b t w d -> b t (w d)') if exists(actor.obs_history) else states
+    if not exists(actor.action_history):
+        return obs
+    act = rearrange(actor.action_history(actions, past = past_actions, past_mask = past_mask), 'b t w d -> b t (w d)')
+    return cat((obs, act), dim = -1)
+
+class RolloutHistory:
+    def __init__(self, actor, batch_size, device):
+        self.obs_history = actor.obs_history
+        self.action_history = actor.action_history
+
+        self.obs_cache = None
+        self.action_cache = None
+
+        if exists(self.action_history):
+            _, self.action_cache = self.action_history.step(
+                batch_shape = (batch_size, self.action_history.dim),
+                device = device
+            )
+
+    def observe(self, state):
+        if exists(self.obs_history):
+            state, self.obs_cache = self.obs_history.step(state, self.obs_cache)
+            state = rearrange(state, 'b w d -> b (w d)')
+
+        if exists(self.action_history):
+            past_action, _ = self.action_history.step(cache = self.action_cache)
+            past_action = rearrange(past_action, 'b w d -> b (w d)')
+            state = cat((state, past_action), dim = -1)
+
+        return state
+
+    def record_action(self, action):
+        if exists(self.action_history):
+            _, self.action_cache = self.action_history.step(action, self.action_cache)
+
+    def reset(self, done):
+        if exists(self.obs_history) and exists(self.obs_cache):
+            _, self.obs_cache = self.obs_history.step(cache = self.obs_cache, reset = done)
+
+        if exists(self.action_history) and exists(self.action_cache):
+            _, self.action_cache = self.action_history.step(cache = self.action_cache, reset = done)
+
 class Actor(Module):
     def __init__(
         self,
@@ -70,10 +122,15 @@ class Actor(Module):
         dim_action: int,
         bounds = (-1., 1.),
         dim_hidden = 256,
-        depth = 3
+        depth = 3,
+        obs_window = 1,
+        action_window = 0,
+        pad_mode = 'learned',
+        per_slot_pad = True
     ):
         super().__init__()
-        self.net = NormedMLP(dim_state, *([dim_hidden] * depth), dim_action * 2, activation = SiLU())
+        dim_in = init_history(self, dim_state, dim_action, obs_window, action_window, pad_mode, per_slot_pad)
+        self.net = NormedMLP(dim_in, *([dim_hidden] * depth), dim_action * 2, activation = SiLU())
 
         last_linear = self.net.layers[-1][0]
         init.orthogonal_(last_linear.weight, gain = 0.01)
@@ -90,11 +147,17 @@ class Actor(Module):
     def params(self, state):
         return rearrange(self.net(state), '... (d p) -> ... d p', p = 2)
 
-    def entropy(self, state):
-        return self.beta.entropy(self.params(state))
+    def entropy(self, state, actions = None, **kw):
+        return self.beta.entropy(self.params(encode_history(self, state, actions, **kw)))
+
+    def act_tensor(self, state):
+        return self(state)
 
     def act(self, state):
-        return self(state).cpu().numpy()
+        return self.act_tensor(state).cpu().numpy()
+
+    def act_to_history(self, actions):
+        return actions
 
     def forward(self, state):
         params = self.params(state)
@@ -107,12 +170,17 @@ class DiscreteActor(Module):
         num_actions: int,
         dim_hidden = 256,
         depth = 3,
-        action_noise = 0.05
+        action_noise = 0.05,
+        obs_window = 1,
+        action_window = 0,
+        pad_mode = 'learned',
+        per_slot_pad = True
     ):
         super().__init__()
         self.num_actions = num_actions
         self.action_noise = action_noise
-        self.net = NormedMLP(dim_state, *([dim_hidden] * depth), num_actions, activation = SiLU())
+        dim_in = init_history(self, dim_state, num_actions, obs_window, action_window, pad_mode, per_slot_pad)
+        self.net = NormedMLP(dim_in, *([dim_hidden] * depth), num_actions, activation = SiLU())
 
         last_linear = self.net.layers[-1][0]
         init.orthogonal_(last_linear.weight, gain = 0.01)
@@ -121,10 +189,12 @@ class DiscreteActor(Module):
     def dist(self, state):
         return MultiCategorical(self.net(state))
 
-    def entropy(self, state):
-        return self.dist(state).entropy()
+    def entropy(self, state, actions = None, past_actions = None, **kw):
+        if exists(past_actions) and not past_actions.is_floating_point():
+            past_actions = F.one_hot(past_actions.long(), self.num_actions).to(state.dtype)
+        return self.dist(encode_history(self, state, actions, past_actions = past_actions, **kw)).entropy()
 
-    def act(self, state):
+    def act_tensor(self, state):
         actions = self.dist(state).sample(temperature = 0.)
 
         if self.training and self.action_noise > 0.:
@@ -132,7 +202,13 @@ class DiscreteActor(Module):
             random_actions = torch.randint_like(actions, self.num_actions)
             actions = torch.where(noise_mask, random_actions, actions)
 
-        return actions.cpu().numpy()
+        return actions
+
+    def act(self, state):
+        return self.act_tensor(state).cpu().numpy()
+
+    def act_to_history(self, actions):
+        return F.one_hot(actions.long(), self.num_actions).float()
 
     def forward(self, state):
         return self.net(state)
@@ -159,13 +235,18 @@ def evaluate(
     dones = np.zeros(num_episodes, dtype = bool)
     scores = np.zeros(num_episodes, dtype = np.float64)
 
+    hist = RolloutHistory(actor, num_episodes, device)
+
     with temp_eval(actor), torch.no_grad():
         while not dones.all():
             active = ~dones
-            actions = actor.act(as_tensor(states[active], device = device))
+            x = hist.observe(as_tensor(states, device = device))
+            actions_t = actor.act_tensor(x)
+            hist.record_action(actor.act_to_history(actions_t))
+            actions = actions_t.cpu().numpy()
 
-            for k, env_index in enumerate(np.flatnonzero(active)):
-                next_state, reward, terminated, truncated, _ = envs[env_index].step(actions[k])
+            for env_index in np.flatnonzero(active):
+                next_state, reward, terminated, truncated, _ = envs[env_index].step(actions[env_index])
                 scores[env_index] += float(reward)
 
                 if should_record:
@@ -220,6 +301,11 @@ def main(
     env_name: str | None = None,
     out_dir: str | None = None,
     seed = 42,
+    obs_window = 1,
+    action_window = 0,
+    history_pad_mode = 'learned',
+    per_slot_pad_embed = True,
+    action_smoothness_weight = 0.,
     num_envs = 16,
     buffer_capacity = 48_000,
     memmap = True,
@@ -268,6 +354,7 @@ def main(
     env_name = default(env_name, 'LunarLanderContinuous-v3' if continuous else 'LunarLander-v3')
     envs = [gym.make(env_name) for _ in range(num_envs)]
     env_states = [env.reset(seed = seed + i)[0] for i, env in enumerate(envs)]
+    env_is_first = [True] * num_envs
 
     is_discrete = isinstance(envs[0].action_space, gym.spaces.Discrete)
     dim_state = int(envs[0].observation_space.shape[0])
@@ -278,13 +365,20 @@ def main(
 
     # models
 
+    history_kwargs = dict(
+        obs_window = obs_window,
+        action_window = action_window,
+        pad_mode = history_pad_mode,
+        per_slot_pad = per_slot_pad_embed
+    )
+
     if is_discrete:
         num_actions, dim_action = int(envs[0].action_space.n), None
-        actor = DiscreteActor(dim_state, num_actions, action_noise = discrete_action_noise).to(device)
+        actor = DiscreteActor(dim_state, num_actions, action_noise = discrete_action_noise, **history_kwargs).to(device)
     else:
         num_actions, dim_action = None, int(envs[0].action_space.shape[0])
         action_low, action_high = envs[0].action_space.low, envs[0].action_space.high
-        actor = Actor(dim_state, dim_action, bounds = np.stack((action_low, action_high), axis = -1)).to(device)
+        actor = Actor(dim_state, dim_action, bounds = np.stack((action_low, action_high), axis = -1), **history_kwargs).to(device)
 
     ema_actor = EMA(actor, beta = ema_decay, include_online_model = False, update_after_step = 0, update_every = 1).to(device)
 
@@ -318,6 +412,9 @@ def main(
         use_ema_critic = use_ema_critic,
         critic_ema_decay = critic_ema_decay,
         observation_noise_scale = observation_noise_scale,
+        obs_history = actor.obs_history,
+        action_history = actor.action_history,
+        action_smoothness_weight = action_smoothness_weight,
         discount_factor = discount_factor,
         discrete_action_temperature = discrete_temperature
     ).to(device)
@@ -341,19 +438,24 @@ def main(
             next_state = ('float', dim_state),
             reward = 'float',
             terminal = 'float',
-            is_real = ('bool', (), False)
+            is_real = ('bool', (), False),
+            is_first = ('bool', (), False)
         )
     )
 
+    prefix_len = max(obs_window - 1, action_window)
     absorbing_steps = wm_horizon - 1
     real_only = dict(is_real = True)
+    real_starts = dict(is_real = True, is_first = True)
     real_terminals = dict(is_real = True, terminal = lambda x: x > 0.5)
     recent_mixture = [(recent_frac, dict(max_age = recent_window)), (1. - recent_frac, dict())]
 
     running_returns = np.zeros(num_envs)
     train_returns, recent_returns = [], deque(maxlen = rolling_window)
     eval_steps, eval_means = [], []
+    best_eval = -float('inf')
     total_env_steps = 0
+    env_hist = RolloutHistory(actor, num_envs, device)
 
     # environment step helper
 
@@ -365,7 +467,17 @@ def main(
             states_tensor = as_tensor(np.asarray(env_states, dtype = np.float32), device = device)
 
             with torch.no_grad():
-                actions = np.array([env.action_space.sample() for env in envs]) if random_actions else actor.act(states_tensor)
+                x = env_hist.observe(states_tensor)
+                if random_actions:
+                    actions = np.array([env.action_space.sample() for env in envs])
+                    actions_t = as_tensor(actions, device = device, dtype = torch.long if is_discrete else torch.float32)
+                else:
+                    actions_t = actor.act_tensor(x)
+                    actions = actions_t.cpu().numpy()
+
+                env_hist.record_action(actor.act_to_history(actions_t))
+
+            done_flags = np.zeros(num_envs, dtype = bool)
 
             for env_index, env in enumerate(envs):
                 next_state, reward, terminated, truncated, _ = env.step(actions[env_index])
@@ -377,8 +489,10 @@ def main(
                     next_state = next_state,
                     reward = float(reward),
                     terminal = float(terminated),
-                    is_real = True
+                    is_real = True,
+                    is_first = env_is_first[env_index]
                 )
+                env_is_first[env_index] = False
 
                 if terminated:
                     for _ in range(absorbing_steps):
@@ -389,7 +503,8 @@ def main(
                             next_state = next_state,
                             reward = 0.,
                             terminal = 1.,
-                            is_real = False
+                            is_real = False,
+                            is_first = False
                         )
 
                 total_env_steps += 1
@@ -402,8 +517,13 @@ def main(
                     recent_returns.append(episode_return)
                     running_returns[env_index] = 0.
                     env_states[env_index], _ = env.reset()
+                    env_is_first[env_index] = True
+                    done_flags[env_index] = True
                 else:
                     env_states[env_index] = next_state
+
+            if done_flags.any():
+                env_hist.reset(as_tensor(done_flags, device = device))
 
     # world model update helper
 
@@ -483,22 +603,62 @@ def main(
 
         # imagine rollout through frozen world model and update actor via bptt
 
-        initial_states = buffer.sample(
-            batch_size,
-            filter_fields = real_only,
-            mixture = recent_mixture,
-            fields = ('state',),
-            device = device
-        )['state']
+        past_obs = past_actions = past_mask = None
 
-        rollout = supermimic(initial_states, num_rollout_timesteps = imagination_horizon)
+        if prefix_len > 0:
+            starts = buffer.sample(max(1, batch_size // 32), filter_fields = real_starts, allow_empty = True, fields = ('state',), device = device)
+            n_starts = starts['state'].shape[0] if exists(starts) else 0
 
-        entropy = actor.entropy(rollout.states[:, :-1].detach()).mean()
+            seed = buffer.sample(
+                batch_size - n_starts,
+                horizon = prefix_len + 1,
+                filter_fields = real_only,
+                window_filter_mode = 'all',
+                mixture = recent_mixture,
+                to_named_tuple = ('state', 'action'),
+                device = device
+            )
+
+            initial_states, past_obs, past_actions = seed.state[:, -1], seed.state[:, :-1], seed.action[:, :-1]
+            past_mask = torch.ones((initial_states.shape[0], prefix_len), dtype = torch.bool, device = device)
+
+            if n_starts > 0:
+                initial_states = cat((initial_states, starts['state']), dim = 0)
+                past_obs = pad_right_at_dim(past_obs, n_starts, dim = 0)
+                past_actions = pad_right_at_dim(past_actions, n_starts, dim = 0)
+                past_mask = pad_right_at_dim(past_mask, n_starts, dim = 0, value = False)
+        else:
+            initial_states = buffer.sample(
+                batch_size,
+                filter_fields = real_only,
+                mixture = recent_mixture,
+                fields = ('state',),
+                device = device
+            )['state']
+
+        rollout = supermimic(
+            initial_states,
+            past_obs = past_obs,
+            past_actions = past_actions,
+            past_mask = past_mask,
+            num_rollout_timesteps = imagination_horizon
+        )
+
+        entropy = actor.entropy(
+            rollout.states[:, :-1].detach(),
+            rollout.actions.detach(),
+            past_obs = past_obs,
+            past_actions = past_actions,
+            past_mask = past_mask
+        ).mean()
 
         actor_loss = supermimic.actor_loss(
             rollout.rewards,
             rollout.terminals,
-            final_state = rollout.states[:, -1]
+            final_state = rollout.states[:, -1],
+            actions = rollout.actions,
+            past_actions = past_actions,
+            past_mask = past_mask
         ) - entropy_weight * entropy
 
         actor_opt.zero_grad()
@@ -519,8 +679,13 @@ def main(
             rolling_mean = sum(recent_returns) / len(recent_returns) if recent_returns else 0.
             print(f'iter {iteration:4d} | steps {total_env_steps:6d} | train{rolling_window} {rolling_mean:6.1f} | eval {eval_mean:6.1f} ± {eval_std:5.1f}', flush = True)
 
-            torch.save(ema_actor.ema_model.state_dict(), out_path / 'actor.pt')
-            save_returns_plot(train_returns, eval_steps, eval_means, out_path / 'returns.png', title = f'{env_name} — SuperMimic')
+            if eval_mean >= best_eval:
+                best_eval = eval_mean
+                torch.save(ema_actor.ema_model.state_dict(), out_path / 'actor.pt')
+
+            tags = ([f'obs={obs_window}', f'act={action_window}', history_pad_mode] if prefix_len > 0 else []) + ([f'smooth={action_smoothness_weight}'] if action_smoothness_weight > 0 else [])
+            history_suffix = f' ({", ".join(tags)})' if tags else ''
+            save_returns_plot(train_returns, eval_steps, eval_means, out_path / 'returns.png', title = f'{env_name} — SuperMimic{history_suffix}')
 
             if exists(target_return) and eval_mean >= target_return:
                 print(f'reached eval return {eval_mean:.1f} >= {target_return:.1f} at iter {iteration}, stopping early', flush = True)
@@ -529,9 +694,13 @@ def main(
     for env in envs:
         env.close()
 
-    # record final trajectories
+    # record final trajectories from best checkpoint
 
     if num_record_episodes > 0:
+        ckpt_path = out_path / 'actor.pt'
+        if ckpt_path.exists():
+            ema_actor.ema_model.load_state_dict(torch.load(ckpt_path, map_location = device, weights_only = True))
+
         trajectories_dir = out_path / 'trajectories'
         final_mean, final_std = evaluate(env_name, ema_actor.ema_model, device, num_episodes = num_record_episodes, seed_base = 20_000, record_dir = trajectories_dir)
         print(f'saved {num_record_episodes} trajectories to {trajectories_dir} (return {final_mean:.1f} ± {final_std:.1f})', flush = True)
