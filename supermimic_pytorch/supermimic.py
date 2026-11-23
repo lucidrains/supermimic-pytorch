@@ -1,17 +1,33 @@
 from __future__ import annotations
 from collections import namedtuple
-from typing import Callable
+from typing import Callable, Literal
 
 import torch
 from torch import Tensor, as_tensor, cat, is_tensor
-from torch.nn import Module, Linear, Sequential, Tanh, GELU, Identity
+from torch.nn import Module, Parameter, Linear, Sequential, Tanh, GELU, Identity
 import torch.nn.functional as F
 from torch.utils._pytree import tree_map
 
 # ein equations
 
-from einops import rearrange, pack, repeat
-from torch_einops_utils import binary_cross_entropy_with_logits, freeze, frozen, masked_mean, tree_flatten_with_inverse, tree_map_tensor, uniform_like
+import einx
+from einops import rearrange, reduce, pack, repeat
+from torch_einops_utils import (
+    binary_cross_entropy_with_logits,
+    exclusive_cumprod,
+    freeze,
+    frozen,
+    masked_mean,
+    pad_left_at_dim,
+    pad_right_at_dim,
+    pad_right_ndim_to,
+    safe_cat,
+    slice_left_at_dim,
+    slice_right_at_dim,
+    tree_flatten_with_inverse,
+    tree_map_tensor,
+    uniform_like
+)
 from torch_einops_utils.shape import assert_shape, size
 
 # mlps
@@ -22,11 +38,6 @@ from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 from ema_pytorch import EMA
 from assoc_scan import AssocScan
 from discrete_continuous_embed_readout import MultiCategorical
-
-from supermimic_pytorch.history import (
-    HistoryWindow,
-    action_smoothness_penalty
-)
 
 # functions
 
@@ -147,6 +158,204 @@ def to_one_hot(indices: Tensor, num_classes: tuple[int, ...], dtype):
     assert indices.ndim >= 2 and indices.shape[-1] == len(num_classes)
     return cat([F.one_hot(i, n) for i, n in zip(indices.unbind(dim = -1), num_classes)], dim = -1).to(dtype)
 
+# history window & action smoothness
+
+PadMode = Literal['zero', 'replicate', 'learned']
+
+HistoryCache = namedtuple('HistoryCache', ('frames', 'valid', 'inverse'))
+
+def to_mask(mask: Tensor | None, shape: tuple[int, int], device) -> Tensor:
+    if not exists(mask):
+        return torch.ones(shape, dtype = torch.bool, device = device)
+    mask = pad_right_ndim_to(mask, 2).to(device = device, dtype = torch.bool)
+    assert mask.shape == shape
+    return mask
+
+def to_sequence(tensor: Tensor, mask: Tensor | None = None):
+    tensor = rearrange(tensor, 'b d -> b 1 d') if tensor.ndim == 2 else tensor
+    assert tensor.ndim == 3
+    return tensor, to_mask(mask, tensor.shape[:2], tensor.device)
+
+class HistoryWindow(Module):
+    def __init__(
+        self,
+        window_size: int,
+        dim: int | dict | None = None,
+        *,
+        lag: int = 0,
+        future: bool = False,
+        pad_mode: PadMode = 'zero',
+        per_slot_pad: bool = True
+    ):
+        super().__init__()
+        dim = sum(tree_flatten_with_inverse(dim)[0]) if isinstance(dim, dict) else dim
+
+        assert window_size >= 1 and lag >= 0 and pad_mode in ('zero', 'replicate', 'learned')
+        assert pad_mode != 'learned' or exists(dim), '`dim` required for learned pad embed'
+
+        self.window_size = window_size
+        self.dim = dim
+        self.lag = lag
+        self.future = future
+        self.pad_mode = pad_mode
+        self.per_slot_pad = per_slot_pad
+        self.cache_size = window_size + max(lag - 1, 0) # trailing slots hold lag > 1 frames before read()
+
+        pad_shape = (window_size, dim) if per_slot_pad else (dim,)
+        self.pad_embed = Parameter(torch.zeros(pad_shape)) if pad_mode == 'learned' else None
+
+    @property
+    def dim_out(self) -> int:
+        assert exists(self.dim)
+        return self.window_size * self.dim
+
+    def fill(self, windows: Tensor, valid: Tensor) -> Tensor:
+        if exists(self.pad_embed):
+            pattern = '... w, ... w d, w d -> ... w d' if self.per_slot_pad else '... w, ... w d, d -> ... w d'
+            return einx.where(pattern, valid, windows, self.pad_embed.to(windows))
+
+        if self.pad_mode == 'replicate':
+            if self.future:
+                anchor_idx = self.window_size - 1 - valid.flip(-1).int().argmax(dim = -1)
+            else:
+                anchor_idx = valid.int().argmax(dim = -1)
+
+            anchor = einx.get_at('... [w] d, ... -> ... d', windows, anchor_idx)
+            anchor = einx.where('..., ... d, -> ... d', valid.any(dim = -1), anchor, 0.)
+            return einx.where('... w, ... w d, ... d -> ... w d', valid, windows, anchor)
+
+        return einx.where('... w, ... w d, -> ... w d', valid, windows, 0.)
+
+    def unfold(self, tensor: Tensor, pad_value = 0.) -> Tensor:
+        pad_fn, slice_fn = (pad_right_at_dim, slice_right_at_dim) if self.future else (pad_left_at_dim, slice_left_at_dim)
+        windows = pad_fn(tensor, self.window_size - 1 + self.lag, dim = 1, value = pad_value).unfold(1, self.window_size, 1)
+        return rearrange(slice_fn(windows, tensor.shape[1], dim = 1), 'b t ... w -> b t w ...')
+
+    # streaming
+
+    def init_cache(
+        self,
+        batch_size: int,
+        dim: int | None = None,
+        *,
+        past: State | None = None,
+        mask: Tensor | None = None,
+        device = None,
+        dtype = None
+    ) -> HistoryCache:
+        assert not self.future
+        if exists(past):
+            return self.push(past, mask = mask)
+
+        dim = default(dim, self.dim)
+        assert exists(dim), '`dim` required for empty cache'
+        return HistoryCache(
+            torch.zeros((batch_size, self.cache_size, dim), device = device, dtype = dtype),
+            torch.zeros((batch_size, self.cache_size), device = device, dtype = torch.bool),
+            None
+        )
+
+    def reset(self, cache: HistoryCache | None, done: Tensor) -> HistoryCache | None:
+        if not exists(cache):
+            return None
+        keep = ~done.to(device = cache.valid.device, dtype = torch.bool)
+        return cache._replace(valid = einx.logical_and('b w, b -> b w', cache.valid, keep))
+
+    def push(
+        self,
+        frame: State,
+        cache: HistoryCache | None = None,
+        *,
+        mask: Tensor | None = None,
+        reset: Tensor | None = None
+    ) -> HistoryCache:
+        assert not self.future
+        cache = self.reset(cache, reset) if exists(reset) else cache
+        flat, inverse = flatten_state_with_inverse(frame, match = cache.inverse if exists(cache) else None)
+        flat, frame_mask = to_sequence(flat, mask)
+
+        if not exists(cache):
+            cache = self.init_cache(flat.shape[0], flat.shape[-1], device = flat.device, dtype = flat.dtype)
+
+        frames = slice_right_at_dim(cat((cache.frames.to(flat), flat), dim = 1), self.cache_size, dim = 1)
+        valid = slice_right_at_dim(cat((cache.valid.to(frame_mask), frame_mask), dim = 1), self.cache_size, dim = 1)
+        return HistoryCache(frames, valid, inverse)
+
+    def read(self, cache: HistoryCache) -> State:
+        filled = self.fill(cache.frames[:, :self.window_size], cache.valid[:, :self.window_size])
+        return cache.inverse(filled) if exists(cache.inverse) else filled
+
+    def step(
+        self,
+        frame: State,
+        cache: HistoryCache | None = None,
+        *,
+        mask: Tensor | None = None,
+        reset: Tensor | None = None
+    ) -> tuple[State, HistoryCache]:
+        assert self.lag == 0, 'use `read()` then `push()` for lagged windows'
+        cache = self.push(frame, cache, mask = mask, reset = reset)
+        return self.read(cache), cache
+
+    # parallel unfold
+
+    def forward(
+        self,
+        inputs: State,
+        *,
+        past: State | None = None,
+        past_mask: Tensor | None = None,
+        mask: Tensor | None = None,
+        episode_starts: Tensor | None = None,
+        return_mask: bool = False
+    ):
+        flat, inverse = flatten_state_with_inverse(inputs)
+        seq, seq_mask = to_sequence(flat, mask)
+        seq_len = seq.shape[1]
+
+        if exists(episode_starts):
+            episode_starts = to_mask(episode_starts, seq.shape[:2], seq.device)
+
+        if exists(past):
+            past_seq, past_seq_mask = to_sequence(flatten_state(past, match = inverse), past_mask)
+            seq, seq_mask = cat((past_seq, seq), dim = 1), cat((past_seq_mask, seq_mask), dim = 1)
+            if exists(episode_starts):
+                episode_starts = pad_left_at_dim(episode_starts, past_seq.shape[1], dim = 1, value = False)
+
+        windows, valid = self.unfold(seq, 0.), self.unfold(seq_mask, False)
+
+        if exists(episode_starts):
+            episode_ids = episode_starts.long().cumsum(dim = 1)
+            valid = valid & einx.equal('b t w, b t -> b t w', self.unfold(episode_ids, -1), episode_ids)
+
+        windows, valid = slice_right_at_dim(windows, seq_len, dim = 1), slice_right_at_dim(valid, seq_len, dim = 1)
+        out = inverse(self.fill(windows, valid))
+        return (out, valid) if return_mask else out
+
+def resolve_history(window: HistoryWindow | int | None, **kwargs) -> HistoryWindow | None:
+    return (HistoryWindow(window, **kwargs) if window > 0 else None) if isinstance(window, int) else window
+
+def action_smoothness_penalty(
+    actions: State,
+    past_actions: State | None = None,
+    *,
+    past_mask: Tensor | None = None,
+    mask: Tensor | None = None,
+    order: int = 1,
+    episode_starts: Tensor | None = None
+) -> Tensor:
+    assert order >= 1
+    flat_actions, inverse = flatten_state_with_inverse(actions)
+    flat_past = flatten_state(past_actions, match = inverse) if exists(past_actions) else None
+
+    windows, valid = HistoryWindow(order + 1)(
+        flat_actions, past = flat_past, past_mask = past_mask,
+        mask = mask, episode_starts = episode_starts, return_mask = True
+    )
+
+    squared_diff = reduce(torch.diff(windows, n = order, dim = 2).square(), 'b t 1 d -> b t', 'sum')
+    return einx.where('b t, b t, -> b t', valid.all(dim = -1), squared_diff, 0.)
+
 # actor
 
 class HumanoidActor(Module):
@@ -201,10 +410,7 @@ class HumanoidActor(Module):
         is_motion = exists(goal)
         assert is_motion != exists(command), 'pass either goal or command'
 
-        obs = flatten_window(obs)
-
-        if exists(past_action):
-            obs = cat((obs, flatten_window(past_action)), dim = -1)
+        obs = safe_cat((flatten_window(obs), flatten_window(past_action)), dim = -1)
 
         goal = flatten_window(goal) if is_motion else None
 
@@ -247,7 +453,7 @@ class Critic(Module):
     def calc_returns(
         rewards,                # (b n)
         values,                 # (b n + 1)
-        pred_terminal,          # (b n)
+        pred_terminal = None,   # (b n)
         discount_factor = 0.99,
         lam = 0.95
     ):
@@ -256,13 +462,17 @@ class Critic(Module):
         num_steps = size(rewards, 'b n -> n')
 
         assert_shape(values, 'b n -> n', n = num_steps + 1)
-        assert_shape(pred_terminal, 'b n', n = num_steps)
+
+        if exists(pred_terminal):
+            assert_shape(pred_terminal, 'b n', n = num_steps)
+            survival = 1. - pred_terminal
+            gates = discount_factor * survival * lam
+        else:
+            survival = 1.
+            gates = torch.full_like(rewards, discount_factor * lam)
 
         values, next_values = values[..., :-1], values[..., 1:]
-        survival = 1. - pred_terminal
-
         deltas = rewards + discount_factor * survival * next_values - values
-        gates = discount_factor * survival * lam
 
         gae = Critic.assoc_scan(gates, deltas)
         return gae + values
@@ -284,7 +494,7 @@ class Critic(Module):
                 return t
             return repeat(t, 'b d -> b t d', t = num_steps)
 
-        x = cat(compact(state, align(goal), align(sim_context)), dim = -1)
+        x = safe_cat((state, align(goal), align(sim_context)), dim = -1)
         assert_shape(x, '... d', d = self.dim_in)
 
         values = rearrange(self.net(x), '... 1 -> ...')
@@ -520,6 +730,8 @@ class SuperMimic(Module):
         obs_history: HistoryWindow | int | None = None,
         action_history: HistoryWindow | int | None = None,
         goal_window: HistoryWindow | int | None = None,
+        reward_fn: Module | Callable | None = None,
+        termination_fn: Module | Callable | None = None,
         action_smoothness_weight: float = 0.,
         discount_factor = 0.99,
         weight_critic_by_survival = True,
@@ -531,6 +743,8 @@ class SuperMimic(Module):
         self.actor = actor
         self.world_model = world_model
         self.critic = critic
+        self.reward_fn = reward_fn
+        self.termination_fn = termination_fn
 
         self.dim_action = getattr(world_model, 'dim_action', None)
         self.num_discrete_actions = getattr(world_model, 'num_discrete_actions', ())
@@ -545,9 +759,9 @@ class SuperMimic(Module):
         self.state_to_obs = state_to_obs
         self.critic_state_key = critic_state_key
 
-        self.obs_history = (HistoryWindow(obs_history) if obs_history > 0 else None) if isinstance(obs_history, int) else obs_history
-        self.action_history = (HistoryWindow(action_history, self.dim_action, lag = 1) if action_history > 0 else None) if isinstance(action_history, int) else action_history
-        self.goal_window = (HistoryWindow(goal_window, future = True, pad_mode = 'replicate') if goal_window > 0 else None) if isinstance(goal_window, int) else goal_window
+        self.obs_history = resolve_history(obs_history)
+        self.action_history = resolve_history(action_history, dim = self.dim_action, lag = 1)
+        self.goal_window = resolve_history(goal_window, future = True, pad_mode = 'replicate')
 
         self.action_smoothness_weight = action_smoothness_weight
 
@@ -580,29 +794,22 @@ class SuperMimic(Module):
         self.observation_noise_schema = None
         self.observation_noise_dict = None
 
-        if exists(observation_noise_scale):
-            if isinstance(observation_noise_scale, dict):
-                leaves = tree_flatten_with_inverse(observation_noise_scale)[0]
-                can_flatten_state = not (exists(actor_obs_key) or exists(state_to_obs)) and all(is_tensor(t) and t.ndim > 0 for t in leaves)
-
-                if can_flatten_state:
-                    observation_noise_scale, inverse_noise = flatten_state_with_inverse(observation_noise_scale)
-                    self.observation_noise_schema = inverse_noise.schema
-                    observation_noise_scale = as_tensor(observation_noise_scale)
-                else:
-                    self.observation_noise_dict = observation_noise_scale
-                    observation_noise_scale = None
+        if isinstance(observation_noise_scale, dict):
+            leaves, _ = tree_flatten_with_inverse(observation_noise_scale)
+            if not (exists(actor_obs_key) or exists(state_to_obs)) and all(is_tensor(t) and t.ndim > 0 for t in leaves):
+                observation_noise_scale, inv = flatten_state_with_inverse(observation_noise_scale)
+                self.observation_noise_schema = inv.schema
             else:
-                observation_noise_scale = as_tensor(observation_noise_scale)
+                self.observation_noise_dict, observation_noise_scale = observation_noise_scale, None
+        elif exists(observation_noise_scale):
+            observation_noise_scale = as_tensor(observation_noise_scale)
 
         self.register_buffer('observation_noise_scale', observation_noise_scale)
 
     def train(self, mode = True):
         super().train(mode)
-
         if exists(self.ema_critic):
             self.ema_critic.ema_model.eval()
-
         return self
 
     @property
@@ -613,14 +820,18 @@ class SuperMimic(Module):
     def update_ema(self):
         if exists(self.ema_critic):
             self.ema_critic.update()
-
         return self
+
+    def maybe_one_hot_actions(self, actions, dtype):
+        if exists(actions) and self.has_discrete_actions and not actions.is_floating_point():
+            return to_one_hot(actions, self.num_discrete_actions, dtype)
+        return actions
 
     def critic_loss(
         self,
         states: State,          # (b t + 1 d)
         rewards,                # (b t)
-        pred_terminal,          # (b t)
+        pred_terminal = None,   # (b t)
         goals = None,           # (b g) or (b t + 1 g)
         sim_context = None,     # (b c)
         lam = 0.95,
@@ -636,8 +847,8 @@ class SuperMimic(Module):
         if exists(self.critic_state_key):
             states = select_key(states, self.critic_state_key)
 
-        states = flatten_state(states)
-        states, rewards, pred_terminal = states.detach(), rewards.detach(), pred_terminal.detach()
+        states, rewards = flatten_state(states).detach(), rewards.detach()
+        pred_terminal = pred_terminal.detach() if exists(pred_terminal) else None
 
         if exists(goals):
             goals = flatten_state(goals)
@@ -648,27 +859,17 @@ class SuperMimic(Module):
             values = self.target_critic(states, goals, sim_context)
             returns = Critic.calc_returns(rewards, values, pred_terminal, discount_factor = discount_factor, lam = lam)
 
-        # survival weights c_t = prod_{i < t} (1 - d_i)
-
-        if weight_by_survival:
-            survival = 1. - pred_terminal
-            survival_weights = F.pad(survival[:, :-1], (1, 0), value = 1.).cumprod(dim = -1)
+        if weight_by_survival and exists(pred_terminal):
+            survival_weights = exclusive_cumprod(1. - pred_terminal, dim = -1)
             mask = mask * survival_weights if exists(mask) else survival_weights
 
         step_goals = goals[:, :-1] if exists(goals) and goals.ndim == 3 else goals
-
-        return self.critic(
-            states[:, :-1],
-            step_goals,
-            sim_context,
-            returns = returns,
-            mask = mask
-        )
+        return self.critic(states[:, :-1], step_goals, sim_context, returns = returns, mask = mask)
 
     def actor_loss(
         self,
         rewards,                # (b t)
-        pred_terminal,          # (b t)
+        pred_terminal = None,   # (b t)
         bootstrap_value = None, # (b)
         final_state: State | None = None,     # (b d)
         final_goal = None,      # (b g)
@@ -679,29 +880,24 @@ class SuperMimic(Module):
         action_smoothness_weight: float | None = None,
         discount_factor = None
     ):
-        # rewards[t] = r_{t+1}, pred_terminal[t] = d_{t+1} -> aligned, as in eq (2)
+        discount_factor = default(discount_factor, self.discount_factor)
 
-        assert size(pred_terminal, 'b [t]') == size(rewards, 'b [t]')
+        if exists(pred_terminal):
+            assert size(pred_terminal, 'b [t]') == size(rewards, 'b [t]')
+            gates = discount_factor * (1. - pred_terminal)
+        else:
+            gates = torch.full_like(rewards, discount_factor)
 
         smoothness_weight = default(action_smoothness_weight, self.action_smoothness_weight)
         if smoothness_weight > 0.:
             assert exists(actions), '`actions` required when `action_smoothness_weight > 0`'
-            rewards = rewards - smoothness_weight * action_smoothness_penalty(
-                actions, past_actions, past_mask = past_mask
-            )
-
-        # following eq (2) in the paper
-        # rewards are derived analytically from world model next state predictions, actions, mocap related references
-
-        discount_factor = default(discount_factor, self.discount_factor)
-
-        gates = discount_factor * (1. - pred_terminal)
+            past_actions = self.maybe_one_hot_actions(past_actions, rewards.dtype)
+            rewards = rewards - smoothness_weight * action_smoothness_penalty(actions, past_actions, past_mask = past_mask)
 
         # bootstrap value from frozen critic, unless passed in
 
         if not exists(bootstrap_value) and exists(self.critic):
             assert exists(final_state), '`final_state` must be passed when `critic` is set'
-
             if exists(self.critic_state_key):
                 final_state = select_key(final_state, self.critic_state_key)
 
@@ -715,16 +911,7 @@ class SuperMimic(Module):
             rewards, _ = pack([rewards, bootstrap_value], 'b *')
             gates, _ = pack([gates, torch.ones_like(bootstrap_value)], 'b *')
 
-        # reverse assoc scan
-
-        scanned = self.assoc_scan(gates, rewards)
-        discounted_sum_rewards = scanned[:, 0]
-
-        # maximize rewards
-
-        loss = -discounted_sum_rewards.mean()
-
-        return loss
+        return -self.assoc_scan(gates, rewards)[:, 0].mean()
 
     def forward(
         self,
@@ -732,61 +919,48 @@ class SuperMimic(Module):
         sim_context: Tensor | None = None,
         actor_goals: State | None = None,
         actor_cond: Tensor | None = None,
+        references: State | None = None,
         past_obs: State | None = None,
         past_actions: Tensor | None = None,
         past_mask: Tensor | None = None,
         num_rollout_timesteps = 32
     ):
         actor, world_model = self.actor, self.world_model
+        state, inverse_state = flatten_state_with_inverse(initial_state, match = self.observation_noise_schema)
+        batch_size, device, dtype = state.shape[0], state.device, state.dtype
 
-        pred_reward, pred_terminal = self.world_model.pred_reward, self.world_model.pred_terminal
-
-        # maybe flatten dict state
-
-        initial_state, inverse_state = flatten_state_with_inverse(initial_state, match = self.observation_noise_schema)
-        batch_size = size(initial_state, 'b d -> b')
-        device, dtype = initial_state.device, initial_state.dtype
-
-        # maybe unfold future goal windows & init rolling caches
-
-        actor_has_goal = exists(actor_goals)
-
-        if actor_has_goal and exists(self.goal_window):
+        if exists(actor_goals) and exists(self.goal_window):
             actor_goals = tree_map_tensor(lambda t: t[:, :num_rollout_timesteps], self.goal_window(actor_goals))
 
-        obs_cache = act_cache = None
+        past_actions = self.maybe_one_hot_actions(past_actions, dtype)
 
+        obs_cache = None
         if exists(self.obs_history) and exists(past_obs):
-            _, obs_cache = self.obs_history.step(past_obs, mask = past_mask)
+            obs_cache = self.obs_history.push(past_obs, mask = past_mask)
 
+        act_cache = None
         if exists(self.action_history):
-            if exists(past_actions) and self.has_discrete_actions and not past_actions.is_floating_point():
-                past_actions = to_one_hot(past_actions, self.num_discrete_actions, dtype)
-            _, act_cache = self.action_history.step(
-                past_actions, mask = past_mask, batch_shape = (batch_size, self.dim_action), device = device, dtype = dtype
+            act_cache = self.action_history.init_cache(
+                batch_size,
+                self.dim_action,
+                past = past_actions,
+                mask = past_mask,
+                device = device,
+                dtype = dtype
             )
 
-        # rollout actor within the world model
+        # rollout actor within frozen world model
 
-        states = [initial_state]
-        actions = []
-        rewards = []
-        terminals = []
-
-        state = initial_state
+        states, actions, rewards, terminals = [state], [], [], []
 
         obs_noise = default(self.observation_noise_dict, self.observation_noise_scale)
         structured = getattr(actor, 'structured_input', False)
-        is_latent_world_model = hasattr(world_model, 'encode') and hasattr(world_model, 'forward_from_latent')
+        is_latent_wm = hasattr(world_model, 'encode') and hasattr(world_model, 'forward_from_latent')
 
         with frozen(world_model, eval = True):
+            latent = world_model.encode(state) if is_latent_wm else None
 
-            latent = world_model.encode(state) if is_latent_world_model else None
-
-            for time_index in range(num_rollout_timesteps):
-
-                # actor forward
-
+            for t in range(num_rollout_timesteps):
                 obs = inverse_state(state)
 
                 if exists(self.state_to_obs):
@@ -799,22 +973,18 @@ class SuperMimic(Module):
                 if exists(self.obs_history):
                     obs, obs_cache = self.obs_history.step(obs, obs_cache)
 
-                past_action = None
-                if exists(self.action_history):
-                    past_action, _ = self.action_history.step(cache = act_cache)
-
-                actor_goal = tree_map_tensor(lambda t: t[:, time_index], actor_goals) if actor_has_goal else None
+                past_action = self.action_history.read(act_cache) if exists(self.action_history) else None
+                actor_goal = tree_map_tensor(lambda x: x[:, t], actor_goals) if exists(actor_goals) else None
 
                 if structured:
                     action = actor(obs, goal = actor_goal, command = actor_cond, past_action = past_action)
                 else:
-                    actor_inputs = compact(
+                    action = actor(compact(
                         flatten_window(obs),
                         flatten_window(past_action),
                         flatten_window(actor_goal),
                         flatten_window(actor_cond)
-                    )
-                    action = actor(actor_inputs)
+                    ))
 
                 if self.has_discrete_actions:
                     if is_tensor(action) and len(self.num_discrete_actions) > 1:
@@ -826,35 +996,41 @@ class SuperMimic(Module):
                     )
 
                 if exists(self.action_history):
-                    _, act_cache = self.action_history.step(action, act_cache)
+                    act_cache = self.action_history.push(action, act_cache)
 
-                # world model prediction
-
-                if is_latent_world_model:
+                if is_latent_wm:
                     pred = world_model.forward_from_latent(latent, action, sim_context)
                     latent = pred.latent
                 else:
                     pred = world_model(state, action, sim_context)
 
-                # next state
-
-                next_state = pred.state
-
-                # accumulate
-
-                states.append(next_state)
+                state = pred.state
+                states.append(state)
                 actions.append(action)
                 rewards.append(pred.reward)
                 terminals.append(pred.terminal)
 
-                state = next_state
-
-        # return all intermediates
-
         states = inverse_state(rearrange(states, 't b ... -> b t ...'))
         actions = rearrange(actions, 't b ... -> b t ...')
 
-        rewards = rearrange(rewards, 't b -> b t') if pred_reward else None
-        terminals = rearrange(terminals, 't b -> b t') if pred_terminal else None
+        if exists(self.reward_fn) or exists(self.termination_fn):
+            next_states = tree_map_tensor(lambda x: x[:, 1:], states)
+
+        if exists(self.reward_fn):
+            rewards = self.reward_fn(
+                next_states,
+                references,
+                actions = actions,
+                past_actions = past_actions,
+                past_mask = past_mask,
+                sim_context = sim_context
+            )
+        else:
+            rewards = rearrange(rewards, 't b -> b t') if rewards and exists(rewards[0]) else None
+
+        if exists(self.termination_fn):
+            terminals = self.termination_fn(next_states, references)
+        else:
+            terminals = rearrange(terminals, 't b -> b t') if terminals and exists(terminals[0]) else None
 
         return Rollout(states, actions, terminals, rewards)

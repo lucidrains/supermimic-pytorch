@@ -41,8 +41,8 @@ from torch.nn.utils import clip_grad_norm_
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
-from einops import rearrange
-from torch_einops_utils import pad_right_at_dim, temp_eval
+from einops import pack, rearrange
+from torch_einops_utils import pad_right_at_dim, safe_cat, temp_eval
 from ema_pytorch import EMA
 from mean_conc_beta import Beta
 from discrete_continuous_embed_readout import MultiCategorical
@@ -72,48 +72,45 @@ def init_history(actor, dim_state, dim_action, obs_window, action_window, pad_mo
     return dim_obs + dim_act
 
 def encode_history(actor, states, actions = None, past_obs = None, past_actions = None, past_mask = None):
-    obs = rearrange(actor.obs_history(states, past = past_obs, past_mask = past_mask), 'b t w d -> b t (w d)') if exists(actor.obs_history) else states
-    if not exists(actor.action_history):
-        return obs
-    act = rearrange(actor.action_history(actions, past = past_actions, past_mask = past_mask), 'b t w d -> b t (w d)')
-    return cat((obs, act), dim = -1)
+    obs = states
+    if exists(actor.obs_history):
+        obs = rearrange(actor.obs_history(states, past = past_obs, past_mask = past_mask), 'b t w d -> b t (w d)')
+
+    act = None
+    if exists(actor.action_history):
+        act = rearrange(actor.action_history(actions, past = past_actions, past_mask = past_mask), 'b t w d -> b t (w d)')
+
+    return safe_cat((obs, act), dim = -1)
 
 class RolloutHistory:
     def __init__(self, actor, batch_size, device):
-        self.obs_history = actor.obs_history
-        self.action_history = actor.action_history
-
+        self.obs_history, self.action_history = actor.obs_history, actor.action_history
         self.obs_cache = None
         self.action_cache = None
 
         if exists(self.action_history):
-            _, self.action_cache = self.action_history.step(
-                batch_shape = (batch_size, self.action_history.dim),
-                device = device
-            )
+            self.action_cache = self.action_history.init_cache(batch_size, device = device)
 
     def observe(self, state):
         if exists(self.obs_history):
             state, self.obs_cache = self.obs_history.step(state, self.obs_cache)
             state = rearrange(state, 'b w d -> b (w d)')
 
+        past_action = None
         if exists(self.action_history):
-            past_action, _ = self.action_history.step(cache = self.action_cache)
-            past_action = rearrange(past_action, 'b w d -> b (w d)')
-            state = cat((state, past_action), dim = -1)
+            past_action = rearrange(self.action_history.read(self.action_cache), 'b w d -> b (w d)')
 
-        return state
+        return safe_cat((state, past_action), dim = -1)
 
     def record_action(self, action):
         if exists(self.action_history):
-            _, self.action_cache = self.action_history.step(action, self.action_cache)
+            self.action_cache = self.action_history.push(action, self.action_cache)
 
     def reset(self, done):
-        if exists(self.obs_history) and exists(self.obs_cache):
-            _, self.obs_cache = self.obs_history.step(cache = self.obs_cache, reset = done)
-
-        if exists(self.action_history) and exists(self.action_cache):
-            _, self.action_cache = self.action_history.step(cache = self.action_cache, reset = done)
+        if exists(self.obs_history):
+            self.obs_cache = self.obs_history.reset(self.obs_cache, done)
+        if exists(self.action_history):
+            self.action_cache = self.action_history.reset(self.action_cache, done)
 
 class Actor(Module):
     def __init__(
@@ -150,11 +147,8 @@ class Actor(Module):
     def entropy(self, state, actions = None, **kw):
         return self.beta.entropy(self.params(encode_history(self, state, actions, **kw)))
 
-    def act_tensor(self, state):
-        return self(state)
-
     def act(self, state):
-        return self.act_tensor(state).cpu().numpy()
+        return self(state)
 
     def act_to_history(self, actions):
         return actions
@@ -194,7 +188,7 @@ class DiscreteActor(Module):
             past_actions = F.one_hot(past_actions.long(), self.num_actions).to(state.dtype)
         return self.dist(encode_history(self, state, actions, past_actions = past_actions, **kw)).entropy()
 
-    def act_tensor(self, state):
+    def act(self, state):
         actions = self.dist(state).sample(temperature = 0.)
 
         if self.training and self.action_noise > 0.:
@@ -203,9 +197,6 @@ class DiscreteActor(Module):
             actions = torch.where(noise_mask, random_actions, actions)
 
         return actions
-
-    def act(self, state):
-        return self.act_tensor(state).cpu().numpy()
 
     def act_to_history(self, actions):
         return F.one_hot(actions.long(), self.num_actions).float()
@@ -241,7 +232,7 @@ def evaluate(
         while not dones.all():
             active = ~dones
             x = hist.observe(as_tensor(states, device = device))
-            actions_t = actor.act_tensor(x)
+            actions_t = actor.act(x)
             hist.record_action(actor.act_to_history(actions_t))
             actions = actions_t.cpu().numpy()
 
@@ -472,7 +463,7 @@ def main(
                     actions = np.array([env.action_space.sample() for env in envs])
                     actions_t = as_tensor(actions, device = device, dtype = torch.long if is_discrete else torch.float32)
                 else:
-                    actions_t = actor.act_tensor(x)
+                    actions_t = actor.act(x)
                     actions = actions_t.cpu().numpy()
 
                 env_hist.record_action(actor.act_to_history(actions_t))
@@ -579,7 +570,7 @@ def main(
                 device = device
             )
 
-            critic_states = cat((batch.state, rearrange(batch.last_next_state, 'b d -> b 1 d')), dim = 1)
+            critic_states, _ = pack((batch.state, batch.last_next_state), 'b * d')
             critic_loss = supermimic.critic_loss(critic_states, batch.reward / reward_scale, batch.terminal, lam = gae_lam)
 
             if terminal_anchor_weight > 0.:

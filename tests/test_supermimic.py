@@ -260,7 +260,8 @@ def test_e2e_discrete_actions(num_discrete_actions, split_actor_output):
         world_model = world_model,
         critic = critic,
         use_ema_critic = True,
-        action_history = 1
+        action_history = 1,
+        action_smoothness_weight = 0.05
     )
 
     rollout = supermimic(
@@ -275,7 +276,9 @@ def test_e2e_discrete_actions(num_discrete_actions, split_actor_output):
     actor_loss = supermimic.actor_loss(
         rollout.rewards,
         rollout.terminals,
-        final_state = rollout.states[:, -1]
+        final_state = rollout.states[:, -1],
+        actions = rollout.actions,
+        past_actions = action_indices[:, 0]
     )
     actor_loss.backward()
 
@@ -503,8 +506,8 @@ def test_history_window_unfold_and_streaming(pad_mode, per_slot_pad):
 
     # stream step by step and assert exact equivalence
 
-    _, obs_cache = obs_window.step(past_obs, mask = past_mask)
-    _, action_cache = action_window.step(past_actions, mask = past_mask)
+    obs_cache = obs_window.push(past_obs, mask = past_mask)
+    action_cache = action_window.push(past_actions, mask = past_mask)
 
     streamed_obs = []
     streamed_actions = []
@@ -514,8 +517,9 @@ def test_history_window_unfold_and_streaming(pad_mode, per_slot_pad):
         step_obs = tree_map_tensor(lambda x: x[:, t], obs_seq)
 
         obs_win, obs_cache = obs_window.step(step_obs, obs_cache, reset = done)
-        act_win, action_cache = action_window.step(cache = action_cache, reset = done)
-        _, action_cache = action_window.step(action_seq[:, t], action_cache)
+        action_cache = action_window.reset(action_cache, done)
+        act_win = action_window.read(action_cache)
+        action_cache = action_window.push(action_seq[:, t], action_cache)
 
         streamed_obs.append(obs_win)
         streamed_actions.append(act_win)
@@ -532,6 +536,35 @@ def test_history_window_unfold_and_streaming(pad_mode, per_slot_pad):
 
         assert obs_window.pad_embed.grad.abs().sum() > 0
         assert action_window.pad_embed.grad.abs().sum() > 0
+
+@pytest.mark.parametrize('lag', (1, 2, 3))
+def test_history_window_arbitrary_lag_streaming(lag):
+    batch_size, seq_len, dim = 2, 8, 5
+    win = HistoryWindow(3, dim, lag = lag, pad_mode = 'replicate')
+
+    seq = torch.randn(batch_size, seq_len, dim)
+    past = torch.randn(batch_size, 4, dim)
+    past_mask = torch.tensor([[True, True, True, True], [False, False, True, True]])
+    episode_starts = torch.zeros(batch_size, seq_len, dtype = torch.bool)
+    episode_starts[0, 4] = True
+
+    batched = win(seq, past = past, past_mask = past_mask, episode_starts = episode_starts)
+
+    cache = win.init_cache(batch_size, past = past, mask = past_mask)
+    streamed = []
+
+    for t in range(seq_len):
+        cache = win.reset(cache, episode_starts[:, t])
+        streamed.append(win.read(cache))
+        cache = win.push(seq[:, t], cache)
+
+    assert torch.allclose(batched, torch.stack(streamed, dim = 1))
+
+    with pytest.raises(AssertionError):
+        win.step(seq[:, 0])
+
+    with pytest.raises(AssertionError):
+        win(seq, episode_starts = torch.zeros(batch_size, seq_len + 1, dtype = torch.bool))
 
 def test_future_window_and_action_smoothness():
     batch_size = 2
@@ -637,3 +670,47 @@ def test_single_state_single_action_and_compat():
     dict_state = dict(pos = torch.randn(2, 4), vel = torch.randn(2, 6))
     rollout = dict_supermimic(dict_state, num_rollout_timesteps = 3)
     assert rollout.states['pos'].shape == (2, 4, 4)
+
+@pytest.mark.parametrize('use_termination_fn', (False, True))
+def test_analytic_reward_and_optional_terminal(use_termination_fn):
+    world_model = WorldModel(
+        dim_state = 6,
+        dim_action = 2,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_reward = False,
+        pred_terminal = False
+    )
+
+    actor = MLP(6, 16, 2, activation = nn.GELU())
+    critic = Critic(dim_state = 6, dim_goal = 0, dim_sim_context = 0, dim_hiddens = (16,))
+
+    def reward_fn(next_states, references, actions, **kwargs):
+        return -(next_states - references).square().mean(dim = -1) - 0.01 * actions.square().mean(dim = -1)
+
+    termination_fn = (lambda next_states, references: (next_states[..., 0] < -10.).float()) if use_termination_fn else None
+
+    supermimic = SuperMimic(
+        actor = actor,
+        world_model = world_model,
+        critic = critic,
+        reward_fn = reward_fn,
+        termination_fn = termination_fn
+    )
+
+    refs = torch.randn(2, 4, 6)
+    rollout = supermimic(torch.randn(2, 6), references = refs, num_rollout_timesteps = 4)
+
+    assert rollout.rewards.shape == (2, 4)
+    assert exists(rollout.terminals) == use_termination_fn
+
+    critic_loss = supermimic.critic_loss(rollout.states, rollout.rewards, rollout.terminals)
+    critic_loss.backward()
+    assert has_grads(critic)
+    critic.zero_grad()
+
+    actor_loss = supermimic.actor_loss(rollout.rewards, rollout.terminals, final_state = rollout.states[:, -1])
+    actor_loss.backward()
+    assert has_nonzero_grads(actor)
+    assert not has_grads(world_model)
+    assert not has_grads(critic)
