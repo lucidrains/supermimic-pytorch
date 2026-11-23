@@ -121,3 +121,15 @@ $ uv run train_supermimic_cheetah.py
     url      =  {https://arxiv.org/abs/2407.02466},
 }
 ```
+
+```bibtex
+@article{Peng2021AMPAM,
+    title   = {AMP: Adversarial Motion Priors for Stylized Physics-Based Character Control},
+    author  = {Xue Bin Peng and Ze Ma and Pieter Abbeel and Sergey Levine and Angjoo Kanazawa},
+    year    = {2021},
+    eprint  = {2104.02180},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.GR},
+    url     = {https://arxiv.org/abs/2104.02180},
+}
+```
