@@ -72,6 +72,18 @@ actor_loss = supermimic.actor_loss(
 actor_loss.backward()
 ```
 
+## Experiments
+
+Toy `HalfCheetah-v5` experiment - trains an `x-ppo` expert, then tracks an 8-dim pose subset (no velocities or task reward) through the learned world model
+
+```bash
+$ uv run train_supermimic_cheetah.py
+```
+
+<img src="./assets/cheetah_expert_vs_supermimic.webp" width="500px"></img>
+
+<img src="./assets/cheetah_convergence.png" width="500px"></img>
+
 ## Citations
 
 ```bibtex
