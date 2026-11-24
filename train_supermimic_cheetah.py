@@ -58,6 +58,8 @@ from x_ppo import calc_gae, clipped_value_loss_fn, ppo_actor_loss
 
 from supermimic_pytorch import (
     ActionSmoothnessTerm,
+    AdversarialCritic,
+    AdversarialSuperMimic,
     AnalyticalReward,
     Critic,
     HistoryWindow,
@@ -584,7 +586,20 @@ class RolloutPolicy:
         self.obs_cache = self.actor.obs_history.reset(self.obs_cache, done)
         self.action_cache = self.actor.action_history.reset(self.action_cache, done)
 
-def train_supermimic_tracker(dataset: dict, out_path: Path, device, seed = 42, num_iterations = 40) -> dict:
+def train_supermimic_tracker(
+    dataset: dict,
+    out_path: Path,
+    device,
+    seed = 42,
+    num_iterations = 40,
+    amp_weight = 0.,
+    amp_every = 4,
+    amp_prob = 1.,
+    amp_warmup_steps = 0,
+    amp_full_state = False,
+    amp_gp_weight = 0.5,
+    amp_disc_steps = 2
+) -> dict:
     print(f'\n=== Stage 2: Training SuperMimic Tracker (Analytical Rewards on {REF_DIM}-d Pose Subset) ===', flush = True)
     seed_everything(seed)
     start_time = time.time()
@@ -643,6 +658,22 @@ def train_supermimic_tracker(dataset: dict, out_path: Path, device, seed = 42, n
             reward_fn = reward_fn,
             discount_factor = 0.99
         ).to(device)
+
+        motion_critic = motion_critic_opt = norm_train_states = None
+        model = supermimic
+
+        if amp_weight > 0.:
+            motion_critic = AdversarialCritic(
+                dim_feature = train_envs.dim_state if amp_full_state else REF_DIM,
+                feature_fn = None if amp_full_state else slice(0, REF_DIM),
+                dim_hiddens = (256, 256),
+                activation = SiLU(),
+                r1_weight = amp_gp_weight,
+                r2_weight = amp_gp_weight
+            ).to(device)
+            model = AdversarialSuperMimic(supermimic, motion_critic = motion_critic, motion_reward_weight = 0.).to(device)
+            motion_critic_opt = AdamW(motion_critic.parameters(), lr = 5e-4, weight_decay = 1e-5)
+            norm_train_states = as_tensor(train_envs.normalize(dataset['train_states']), device = device)
 
         # optimizers
 
@@ -757,7 +788,9 @@ def train_supermimic_tracker(dataset: dict, out_path: Path, device, seed = 42, n
 
             actor.train()
 
-            for _ in range(policy_updates):
+            for update_idx in range(policy_updates):
+                global_update = (iteration - 1) * policy_updates + update_idx + 1
+
                 seed_batch = buffer.sample(batch_size, horizon = 2, to_named_tuple = seed_fields, device = device)
                 clip_ids = seed_batch.clip_id[:, -1].long()
                 frame_ids = seed_batch.frame_idx[:, -1].long()
@@ -765,16 +798,23 @@ def train_supermimic_tracker(dataset: dict, out_path: Path, device, seed = 42, n
                 goals = gather_refs(train_envs.refs, clip_ids, frame_ids + 1, imag_horizon + GOAL_WINDOW)
                 critic_goals = goals[:, :imag_horizon + 1]
 
-                rollout = supermimic(
+                amp_kwargs = dict()
+                if exists(motion_critic):
+                    active = divisible_by(global_update, amp_every) and (amp_prob >= 1. or np.random.rand() < amp_prob)
+                    ramp = min(1., global_update / amp_warmup_steps) if amp_warmup_steps > 0 else 1.
+                    amp_kwargs['motion_reward_weight'] = amp_weight * ramp if active else 0.
+
+                rollout = model(
                     seed_batch.state[:, -1],
                     actor_goals = goals,
                     references = goals[:, :imag_horizon],
                     past_obs = seed_batch.state[:, :-1],
                     past_actions = seed_batch.action[:, :-1],
-                    num_rollout_timesteps = imag_horizon
+                    num_rollout_timesteps = imag_horizon,
+                    **amp_kwargs
                 )
 
-                actor_loss = supermimic.actor_loss(
+                actor_loss = model.actor_loss(
                     rollout.rewards,
                     final_state = rollout.states[:, -1],
                     final_goal = critic_goals[:, -1]
@@ -784,12 +824,26 @@ def train_supermimic_tracker(dataset: dict, out_path: Path, device, seed = 42, n
                 actor_scheduler.step()
                 ema_actor.update()
 
-                # fit critic on imagined trajectories
+                # fit critic on task rewards (stationary when AMP is titrated in occasionally)
+
+                critic_rewards = getattr(rollout, 'task_rewards', rollout.rewards)
 
                 for _ in range(4):
-                    critic_loss = supermimic.critic_loss(rollout.states, rollout.rewards, goals = critic_goals, lam = 0.95)
+                    critic_loss = model.critic_loss(rollout.states, critic_rewards, goals = critic_goals, lam = 0.95)
                     step_optimizer(critic_opt, critic_loss, critic.parameters())
-                    supermimic.update_ema()
+                    model.update_ema()
+
+                # update AMP discriminator on active steps (after actor backward)
+
+                if exists(motion_critic) and exists(rollout.motion_rewards):
+                    motion_critic.train()
+                    fake_states = rollout.states.detach()
+
+                    for _ in range(amp_disc_steps):
+                        ref_clips = torch.randint(0, norm_train_states.shape[0], (batch_size,), device = device)
+                        ref_starts = torch.randint(0, norm_train_states.shape[1] - imag_horizon - 1, (batch_size,), device = device)
+                        ref_states = gather_refs(norm_train_states, ref_clips, ref_starts, imag_horizon + 1)
+                        step_optimizer(motion_critic_opt, model.motion_critic_loss(ref_states, fake_states), motion_critic.parameters())
 
             if divisible_by(iteration, 2) or iteration == num_iterations:
                 metrics = eval_ema(iteration, wm_loss)
@@ -1036,6 +1090,13 @@ def main(
     expert_steps = 400_000,
     expert_target_return = 3500.,
     num_iterations = 40,
+    amp_weight = 0.,
+    amp_every = 4,
+    amp_prob = 1.,
+    amp_warmup_steps = 0,
+    amp_full_state = False,
+    amp_gp_weight = 0.5,
+    amp_disc_steps = 2,
     compare_ppo = True,
     ppo_tracker_steps = 50_000
 ):
@@ -1060,7 +1121,20 @@ def main(
             target_return = expert_target_return
         )
 
-    sm_result = train_supermimic_tracker(dataset, out_path, device, seed = seed, num_iterations = num_iterations)
+    sm_result = train_supermimic_tracker(
+        dataset,
+        out_path,
+        device,
+        seed = seed,
+        num_iterations = num_iterations,
+        amp_weight = amp_weight,
+        amp_every = amp_every,
+        amp_prob = amp_prob,
+        amp_warmup_steps = amp_warmup_steps,
+        amp_full_state = amp_full_state,
+        amp_gp_weight = amp_gp_weight,
+        amp_disc_steps = amp_disc_steps
+    )
 
     ppo_history = None
     if compare_ppo:

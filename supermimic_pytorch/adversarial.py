@@ -344,7 +344,8 @@ class AdversarialSuperMimic(Module):
         next_terminals: Tensor | None = None,
         next_rewards: Tensor | None = None,
         *,
-        dynamics_cond: State | None = None
+        dynamics_cond: State | None = None,
+        world_model_adv_weight: float | None = None
     ) -> WorldModelRollout:
         wm_loss, preds, losses = self.supermimic.world_model.rollout(
             state, actions, next_states,
@@ -357,10 +358,12 @@ class AdversarialSuperMimic(Module):
         imagined_states = stack_states([state, *(p.state for p in preds)])
         adv_loss = None
 
-        if exists(self.dynamics_critic) and self.world_model_adv_weight > 0.:
+        world_model_adv_weight = default(world_model_adv_weight, self.world_model_adv_weight)
+
+        if exists(self.dynamics_critic) and world_model_adv_weight > 0.:
             act = self._format_actions(actions, state)
             adv_loss = -self._score(self.dynamics_critic, imagined_states, act, default(dynamics_cond, sim_context)).mean()
-            wm_loss = wm_loss + self.world_model_adv_weight * adv_loss
+            wm_loss = wm_loss + world_model_adv_weight * adv_loss
 
         return WorldModelRollout(wm_loss, real_states, imagined_states, preds, losses, adv_loss)
 
@@ -373,31 +376,38 @@ class AdversarialSuperMimic(Module):
         *args,
         motion_cond: State | None = None,
         dynamics_cond: State | None = None,
+        task_reward_weight: float | None = None,
+        motion_reward_weight: float | None = None,
+        pessimism_weight: float | None = None,
         **kwargs
     ) -> AdversarialRollout:
         rollout = self.supermimic(initial_state, sim_context, *args, **kwargs)
         horizon = rollout.actions.shape[1]
 
+        task_reward_weight = default(task_reward_weight, self.task_reward_weight)
+        motion_reward_weight = default(motion_reward_weight, self.motion_reward_weight)
+        pessimism_weight = default(pessimism_weight, self.pessimism_weight)
+
         task_rewards = rollout.rewards
         motion_rewards = realism_rewards = None
         terms = []
 
-        if exists(task_rewards) and self.task_reward_weight != 0.:
-            terms.append(self.task_reward_weight * task_rewards)
+        if exists(task_rewards) and task_reward_weight != 0.:
+            terms.append(task_reward_weight * task_rewards)
 
-        if exists(self.motion_critic) and self.motion_reward_weight != 0.:
+        if exists(self.motion_critic) and motion_reward_weight != 0.:
             motion_rewards = self._score(
                 self.motion_critic, rollout.states, rollout.actions, motion_cond,
                 horizon = horizon, detach = self.detach_motion_reward
             )
-            terms.append(self.motion_reward_weight * motion_rewards)
+            terms.append(motion_reward_weight * motion_rewards)
 
-        if exists(self.dynamics_critic) and self.pessimism_weight != 0.:
+        if exists(self.dynamics_critic) and pessimism_weight != 0.:
             realism_rewards = self._score(
                 self.dynamics_critic, rollout.states, rollout.actions, default(dynamics_cond, sim_context),
                 horizon = horizon, detach = self.detach_pessimism_reward
             )
-            terms.append(self.pessimism_weight * realism_rewards)
+            terms.append(pessimism_weight * realism_rewards)
 
         total_rewards = sum(terms[1:], terms[0]) if terms else task_rewards
         return AdversarialRollout(*rollout[:3], total_rewards, task_rewards, motion_rewards, realism_rewards)

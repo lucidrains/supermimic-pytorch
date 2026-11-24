@@ -4,8 +4,13 @@ from torch import nn
 
 from x_mlps_pytorch import MLP
 
-from supermimic_pytorch import Critic, SuperMimic, WorldModel
-from supermimic_pytorch.adversarial import AdversarialCritic, AdversarialSuperMimic
+from supermimic_pytorch import (
+    AdversarialCritic,
+    AdversarialSuperMimic,
+    Critic,
+    SuperMimic,
+    WorldModel
+)
 
 def has_grads(module):
     return any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
@@ -96,3 +101,55 @@ def test_adversarial_supermimic_e2e(loss_type, detach_motion_reward):
     assert not has_grads(motion_critic)
     assert not has_grads(dynamics_critic)
     assert not has_grads(value_critic)
+
+def test_amp_titration():
+    batch_size, horizon, dim_state, dim_action = 2, 3, 8, 4
+
+    world_model = WorldModel(
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = False
+    )
+    actor = MLP(dim_state, 16, dim_action, activation = nn.GELU())
+    supermimic = SuperMimic(actor = actor, world_model = world_model)
+    motion_critic = AdversarialCritic(dim_feature = dim_state, dim_hiddens = (16,))
+    dynamics_critic = AdversarialCritic(dim_feature = dim_state, dim_action = dim_action, dim_hiddens = (16,))
+
+    adapter = AdversarialSuperMimic(
+        supermimic,
+        motion_critic = motion_critic,
+        dynamics_critic = dynamics_critic,
+        motion_reward_weight = 0.5,
+        pessimism_weight = 0.1,
+        world_model_adv_weight = 0.1
+    )
+
+    s0 = torch.randn(batch_size, dim_state)
+
+    # zero weight on forward skips motion / dynamics critics cleanly
+
+    r_off = adapter(s0, num_rollout_timesteps = horizon, motion_reward_weight = 0., pessimism_weight = 0.)
+    assert r_off.motion_rewards is None and r_off.realism_rewards is None
+    assert torch.allclose(r_off.rewards, r_off.task_rewards)
+
+    adapter.actor_loss(r_off.rewards).backward()
+    assert has_grads(actor) and not has_grads(motion_critic)
+    actor.zero_grad()
+
+    # titrating motion weight on forward scales reward without mutating defaults
+
+    r_low = adapter(s0, num_rollout_timesteps = horizon, motion_reward_weight = 0.2, pessimism_weight = 0.)
+    r_high = adapter(s0, num_rollout_timesteps = horizon, motion_reward_weight = 0.8, task_reward_weight = 0.5, pessimism_weight = 0.)
+    assert torch.allclose(r_low.rewards, r_low.task_rewards + 0.2 * r_low.motion_rewards)
+    assert torch.allclose(r_high.rewards, 0.5 * r_high.task_rewards + 0.8 * r_high.motion_rewards)
+    assert adapter.motion_reward_weight == 0.5 and adapter.task_reward_weight == 1.
+
+    # world model adversarial weight override
+
+    actions = torch.randn(batch_size, horizon, dim_action)
+    next_states = torch.randn(batch_size, horizon, dim_state)
+    assert adapter.world_model_rollout(s0, actions, next_states, world_model_adv_weight = 0.).adv_loss is None
+    assert adapter.world_model_rollout(s0, actions, next_states, world_model_adv_weight = 0.2).adv_loss is not None
