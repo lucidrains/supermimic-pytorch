@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
 
@@ -48,7 +49,8 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from einops import rearrange
-from torch_einops_utils import safe_cat, temp_eval
+from torch_einops_utils import pad_right_at_dim, safe_cat, temp_eval
+from torch_einops_utils.shape import shape, size
 from ema_pytorch import EMA
 from mean_conc_beta import Beta
 from memmap_replay_buffer import StreamReplayBuffer
@@ -85,6 +87,9 @@ def default(v, d):
 def divisible_by(num, den):
     return (num % den) == 0
 
+def cosine_anneal(start: float, end: float, frac: float) -> float:
+    return end + (start - end) * 0.5 * (1. + math.cos(math.pi * frac))
+
 def seed_everything(seed: int):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -118,7 +123,7 @@ def make_reward(mean: Tensor | None = None, std: Tensor | None = None, smoothnes
 
 def gather_refs(refs: Tensor, clip_ids: Tensor, starts: Tensor, length: int) -> Tensor:
     offsets = torch.arange(length, device = refs.device)
-    frames = einx.add('b, l -> b l', starts, offsets).clamp(max = refs.shape[1] - 1)
+    frames = einx.add('b, l -> b l', starts, offsets).clamp(max = size(refs, 'c [t] d') - 1)
     return einx.get_at('[c] [t] d, b, b l -> b l d', refs, clip_ids, frames)
 
 # parallel mocap envs with reference state initialization (RSI)
@@ -140,7 +145,7 @@ class MocapEnvs:
         self.qvel = dataset[f'{split}_qvel']
         self.refs = as_tensor(dataset[f'{split}_refs'], device = device)
 
-        self.num_clips, self.total_frames = self.refs.shape[:2]
+        self.num_clips, self.total_frames = shape(self.refs, '[c t] d')
         self.num_envs = default(num_envs, self.num_clips)
         self.horizon = default(horizon, self.total_frames - 1)
         self.max_start = max(1, self.total_frames - self.horizon - 2)
@@ -356,7 +361,7 @@ def ppo_update(agent: PPOAgent, opt: AdamW, get_obs, step_env, rollout_steps: in
     flat_advantages = rearrange(gae.advantages, 'e t -> (e t)')
     flat_returns = rearrange(gae.returns, 'e t -> (e t)')
 
-    num_samples = flat_obs.shape[0]
+    num_samples = size(flat_obs, '[n] ...')
 
     for _ in range(10):
         perm = torch.randperm(num_samples, device = device)
@@ -538,7 +543,8 @@ class TrackingActor(Module):
         action_window = 1,
         goal_window = GOAL_WINDOW,
         dim_hidden = 256,
-        depth = 3
+        depth = 3,
+        dim_explorative_latent = 0
     ):
         super().__init__()
         self.dim_action = dim_action
@@ -547,13 +553,18 @@ class TrackingActor(Module):
         self.action_history = HistoryWindow(action_window, dim_action, lag = 1, pad_mode = 'zero')
         self.goal_window = HistoryWindow(goal_window, dim_ref, future = True, pad_mode = 'replicate')
 
-        dim_in = obs_window * dim_state + action_window * dim_action + goal_window * dim_ref
-        self.net = NormedMLP(dim_in, *([dim_hidden] * depth), dim_action, activation = SiLU())
+        self.dim_in = obs_window * dim_state + action_window * dim_action + goal_window * dim_ref + dim_explorative_latent
+        self.net = NormedMLP(self.dim_in, *([dim_hidden] * depth), dim_action, activation = SiLU())
 
         init.orthogonal_(self.net.layers[-1][0].weight, gain = 0.01)
         init.zeros_(self.net.layers[-1][0].bias)
 
-    def forward(self, x: Tensor) -> Tensor:
+    def forward(self, x: Tensor | tuple[Tensor, ...]) -> Tensor:
+        if isinstance(x, (list, tuple)):
+            x = torch.cat(x, dim = -1)
+        pad = self.dim_in - size(x, '... [d]')
+        if pad > 0:
+            x = pad_right_at_dim(x, pad, dim = -1)
         return self.net(x).tanh()
 
 class RolloutPolicy:
@@ -592,6 +603,10 @@ def train_supermimic_tracker(
     device,
     seed = 42,
     num_iterations = 40,
+    num_explorative_rollouts = 2,
+    dim_explorative_latent = 4,
+    explorative_latent_scale = 0.28,
+    explorative_latent_scale_end = 0.03,
     amp_weight = 0.,
     amp_every = 4,
     amp_prob = 1.,
@@ -609,6 +624,7 @@ def train_supermimic_tracker(
     imag_horizon = 24
     policy_updates = 4
     batch_size = 256
+    active_latent_dim = dim_explorative_latent if num_explorative_rollouts > 1 else 0
 
     with (
         MocapEnvs(dataset, 'train', device, num_envs = num_envs, horizon = 128) as train_envs,
@@ -616,7 +632,12 @@ def train_supermimic_tracker(
     ):
         # models
 
-        actor = TrackingActor(train_envs.dim_state, train_envs.dim_action, REF_DIM).to(device)
+        actor = TrackingActor(
+            train_envs.dim_state,
+            train_envs.dim_action,
+            REF_DIM,
+            dim_explorative_latent = active_latent_dim
+        ).to(device)
         ema_actor = EMA(actor, beta = 0.98, include_online_model = False, update_after_step = 0, update_every = 1).to(device)
 
         world_model = WorldModel(
@@ -656,7 +677,10 @@ def train_supermimic_tracker(
             action_history = actor.action_history,
             goal_window = actor.goal_window,
             reward_fn = reward_fn,
-            discount_factor = 0.99
+            discount_factor = 0.99,
+            num_explorative_rollouts = num_explorative_rollouts,
+            dim_explorative_latent = active_latent_dim,
+            explorative_latent_scale = explorative_latent_scale
         ).to(device)
 
         motion_critic = motion_critic_opt = norm_train_states = None
@@ -787,6 +811,11 @@ def train_supermimic_tracker(
             # imagine through frozen world model and update actor via bptt
 
             actor.train()
+            cur_latent_scale = cosine_anneal(
+                explorative_latent_scale,
+                explorative_latent_scale_end,
+                (iteration - 1) / max(1, num_iterations - 1)
+            )
 
             for update_idx in range(policy_updates):
                 global_update = (iteration - 1) * policy_updates + update_idx + 1
@@ -811,6 +840,7 @@ def train_supermimic_tracker(
                     past_obs = seed_batch.state[:, :-1],
                     past_actions = seed_batch.action[:, :-1],
                     num_rollout_timesteps = imag_horizon,
+                    explorative_latent_scale = cur_latent_scale,
                     **amp_kwargs
                 )
 
@@ -840,8 +870,9 @@ def train_supermimic_tracker(
                     fake_states = rollout.states.detach()
 
                     for _ in range(amp_disc_steps):
-                        ref_clips = torch.randint(0, norm_train_states.shape[0], (batch_size,), device = device)
-                        ref_starts = torch.randint(0, norm_train_states.shape[1] - imag_horizon - 1, (batch_size,), device = device)
+                        num_ref_clips, num_ref_frames = shape(norm_train_states, '[c t] d')
+                        ref_clips = torch.randint(0, num_ref_clips, (batch_size,), device = device)
+                        ref_starts = torch.randint(0, num_ref_frames - imag_horizon - 1, (batch_size,), device = device)
                         ref_states = gather_refs(norm_train_states, ref_clips, ref_starts, imag_horizon + 1)
                         step_optimizer(motion_critic_opt, model.motion_critic_loss(ref_states, fake_states), motion_critic.parameters())
 
@@ -1090,6 +1121,10 @@ def main(
     expert_steps = 400_000,
     expert_target_return = 3500.,
     num_iterations = 40,
+    num_explorative_rollouts = 2,
+    dim_explorative_latent = 4,
+    explorative_latent_scale = 0.28,
+    explorative_latent_scale_end = 0.03,
     amp_weight = 0.,
     amp_every = 4,
     amp_prob = 1.,
@@ -1127,6 +1162,10 @@ def main(
         device,
         seed = seed,
         num_iterations = num_iterations,
+        num_explorative_rollouts = num_explorative_rollouts,
+        dim_explorative_latent = dim_explorative_latent,
+        explorative_latent_scale = explorative_latent_scale,
+        explorative_latent_scale_end = explorative_latent_scale_end,
         amp_weight = amp_weight,
         amp_every = amp_every,
         amp_prob = amp_prob,

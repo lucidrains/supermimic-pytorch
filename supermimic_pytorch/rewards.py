@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import einx
 from einops import einsum, rearrange, reduce, repeat
 from torch_einops_utils import orthogonal_component, safe_cat
+from torch_einops_utils.shape import is_shape, shape
 
 from supermimic_pytorch.supermimic import (
     State,
@@ -30,7 +31,7 @@ def cross(a: Tensor, b: Tensor) -> Tensor:
     return torch.linalg.cross(a, b, dim = -1)
 
 def is_static_ref(pred: Tensor, target: Tensor) -> bool:
-    return pred.ndim >= 3 and target.shape == (pred.shape[0], *pred.shape[2:])
+    return pred.ndim >= 3 and shape(pred, '[b] t [...rest]') == target
 
 def align_time(pred: Tensor, target: Tensor) -> Tensor:
     return rearrange(target, 'b ... -> b 1 ...') if is_static_ref(pred, target) else target
@@ -76,7 +77,7 @@ def quat_mul(q1: Tensor, q2: Tensor) -> Tensor:
 def axis_angle_to_quat(axis: Tensor, angle: Tensor) -> Tensor:
     half = 0.5 * angle
     v = einsum(l2norm(axis), half.sin(), '... d, ... -> ... d')
-    w = rearrange(half.cos().expand(v.shape[:-1]), '... -> ... 1')
+    w = rearrange(half.cos().expand(shape(v, '[...] d').shape), '... -> ... 1')
     return cat((w, v), dim = -1)
 
 def quat_rotate(q: Tensor, v: Tensor, inverse = False) -> Tensor:
@@ -102,7 +103,7 @@ def world_to_heading_frame(q: Tensor, v: Tensor) -> Tensor:
     rx = c * vx + s * vy
     ry = -s * vx + c * vy
 
-    if v.shape[-1] == 2:
+    if is_shape(v, '... 2'):
         return stack((rx, ry), dim = -1)
 
     return stack((rx, ry, v[..., 2].expand_as(rx)), dim = -1)
@@ -132,11 +133,11 @@ def angle_diff(pred: Tensor, target: Tensor) -> Tensor:
 
 def rotation_squared_error(pred: Tensor, target: Tensor) -> Tensor:
     # geodesic squared angle ||log(R_des R^T)||^2 across rotmat, quat, 6d rot, or 2d angle
-    if pred.ndim >= 2 and pred.shape[-2:] == (3, 3):
+    if is_shape(pred, '... 3 3'):
         sin_half_sq = reduce((target - pred).square(), '... i j -> ...', 'sum') / 8.
         return sin_half_sq_to_angle_sq(sin_half_sq)
 
-    if pred.shape[-1] == 4:
+    if is_shape(pred, '... 4'):
         p = l2norm(pred)
         t = l2norm(target)
         dot = einsum(p, t, '... d, ... d -> ...')
@@ -144,11 +145,11 @@ def rotation_squared_error(pred: Tensor, target: Tensor) -> Tensor:
         sin_quarter_sq = reduce((t - p).square(), '... d -> ...', 'sum') / 4.
         return 4. * sin_half_sq_to_angle_sq(sin_quarter_sq)
 
-    if pred.shape[-1] == 6:
+    if is_shape(pred, '... 6'):
         return rotation_squared_error(rot6d_to_rotmat(pred), rot6d_to_rotmat(target))
 
     err = angle_diff(pred, target).square()
-    return rearrange(err, '... 1 -> ...') if err.ndim > 0 and err.shape[-1] == 1 else err
+    return rearrange(err, '... 1 -> ...') if is_shape(err, '... 1') else err
 
 # analytical reward terms
 
@@ -578,7 +579,7 @@ class ForwardKinematics(Module):
     ) -> dict[str, Tensor]:
         out, qpos, qvel = self.resolve_inputs(state, qpos, qvel)
         has_vel = exists(qvel)
-        lead = qpos.shape[:-1]
+        lead = shape(qpos, '[...] d').shape
 
         offsets, local_quats, joint_axes, joint_pos, joint_qpos0 = (
             t.to(qpos) for t in (self.offsets, self.local_quats, self.joint_axes, self.joint_pos, self.joint_qpos0)
@@ -668,7 +669,7 @@ UNITREE_VELOCITY_WEIGHTS = dict(
 )
 
 def is_unitree_g1_tensor(t) -> bool:
-    return is_tensor(t) and t.shape[-1] == UNITREE_G1_STATE_DIM
+    return is_shape(t, '... d', d = UNITREE_G1_STATE_DIM)
 
 def unpack_unitree_g1_state(state: State, strict = True) -> State:
     if isinstance(state, dict):
@@ -765,7 +766,7 @@ def unitree_motion_tracking_reward(
 def extract_velocity_command(references: State) -> dict[str, Tensor]:
     if isinstance(references, dict):
         return references
-    assert is_tensor(references) and references.shape[-1] == 3, 'velocity command must be (..., 3) [vx, vy, wz] or dict'
+    assert is_shape(references, '... 3'), 'velocity command must be (..., 3) [vx, vy, wz] or dict'
     return dict(lin_vel = references[..., :2], yaw_rate = references[..., 2:3])
 
 def heading_lin_vel(state: dict[str, Tensor]) -> Tensor:

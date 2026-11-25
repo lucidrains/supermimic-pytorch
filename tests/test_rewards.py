@@ -30,11 +30,14 @@ from supermimic_pytorch import (
 )
 from supermimic_pytorch.rewards import axis_angle_to_quat, quat_to_rotmat
 
+def exists(v):
+    return v is not None
+
 def has_grads(module):
-    return any(p.grad is not None for p in module.parameters())
+    return any(exists(p.grad) for p in module.parameters())
 
 def has_nonzero_grads(module):
-    return any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+    return any(exists(p.grad) and p.grad.abs().sum() > 0 for p in module.parameters())
 
 # 1. differentiable geometry (SO(3), quaternions, 6D rot, SO(2) angles)
 
@@ -251,7 +254,7 @@ def test_unitree_motion_and_velocity_rewards_exact_and_bptt():
     lower, upper = torch.full((29,), -1.5), torch.full((29,), 1.5)
     motion_reward = unitree_motion_tracking_reward(fk = fk, joint_limits = (lower, upper))
     assert fk in set(motion_reward.modules())
-    assert pickle.loads(pickle.dumps(motion_reward)) is not None
+    assert exists(pickle.loads(pickle.dumps(motion_reward)))
 
     # exact tracking yields max Table A.2 reward * dt, and weights override cleanly
 
@@ -279,7 +282,7 @@ def test_unitree_motion_and_velocity_rewards_exact_and_bptt():
     # Table A.6 velocity reward: forward pitch unpenalized, sideways roll penalized, static (b, 3) command broadcasts
 
     vel_reward = unitree_velocity_tracking_reward(joint_limits = (lower, upper))
-    assert pickle.loads(pickle.dumps(vel_reward)) is not None
+    assert exists(pickle.loads(pickle.dumps(vel_reward)))
     cmd = torch.tensor([[1.0, 0.0, 0.5]]).expand(batch_size, 3)
 
     s_pitch = state71.clone()

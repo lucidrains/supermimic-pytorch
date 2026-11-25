@@ -133,3 +133,27 @@ $ uv run train_supermimic_cheetah.py
     url     = {https://arxiv.org/abs/2104.02180},
 }
 ```
+
+```bibtex
+@misc{gladstone2026explorativemodelingunlockingpretraining,
+    title   = {Explorative Modeling: Unlocking a Third Pretraining Axis and End-to-End Generation},
+    author  = {Alexi Gladstone and Heng Ji and Yilun Du},
+    year    = {2026},
+    eprint  = {2607.27372},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2607.27372},
+}
+```
+
+```bibtex
+@misc{jia2025antitheticnoisediffusionmodels,
+    title   = {Antithetic Noise in Diffusion Models},
+    author  = {Jing Jia and Sifan Liu and Bowen Song and Wei Yuan and Liyue Shen and Guanyang Wang},
+    year    = {2025},
+    eprint  = {2506.06185},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url     = {https://arxiv.org/abs/2506.06185},
+}
+```

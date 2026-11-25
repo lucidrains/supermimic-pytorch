@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 os.environ.setdefault('PYTORCH_ENABLE_MPS_FALLBACK', '1')
 
@@ -43,6 +44,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from einops import pack, rearrange
 from torch_einops_utils import pad_right_at_dim, safe_cat, temp_eval
+from torch_einops_utils.shape import size
 from ema_pytorch import EMA
 from mean_conc_beta import Beta
 from discrete_continuous_embed_readout import MultiCategorical
@@ -50,6 +52,7 @@ from memmap_replay_buffer import StreamReplayBuffer
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
 from supermimic_pytorch import WorldModel, Critic, SuperMimic, HistoryWindow
+from supermimic_pytorch.supermimic import repeat_batch
 
 # helpers
 
@@ -61,6 +64,15 @@ def default(v, d):
 
 def divisible_by(num, den):
     return (num % den) == 0
+
+def cosine_anneal(start: float, end: float, frac: float) -> float:
+    return end + (start - end) * 0.5 * (1. + math.cos(math.pi * frac))
+
+def pad_to_dim(x, dim: int):
+    if isinstance(x, (list, tuple)):
+        x = cat(x, dim = -1)
+    pad = dim - size(x, '... [d]')
+    return pad_right_at_dim(x, pad, dim = -1) if pad > 0 else x
 
 # actor
 
@@ -123,11 +135,12 @@ class Actor(Module):
         obs_window = 1,
         action_window = 0,
         pad_mode = 'learned',
-        per_slot_pad = True
+        per_slot_pad = True,
+        dim_explorative_latent = 0
     ):
         super().__init__()
-        dim_in = init_history(self, dim_state, dim_action, obs_window, action_window, pad_mode, per_slot_pad)
-        self.net = NormedMLP(dim_in, *([dim_hidden] * depth), dim_action * 2, activation = SiLU())
+        self.dim_in = init_history(self, dim_state, dim_action, obs_window, action_window, pad_mode, per_slot_pad) + dim_explorative_latent
+        self.net = NormedMLP(self.dim_in, *([dim_hidden] * depth), dim_action * 2, activation = SiLU())
 
         last_linear = self.net.layers[-1][0]
         init.orthogonal_(last_linear.weight, gain = 0.01)
@@ -142,7 +155,7 @@ class Actor(Module):
         )
 
     def params(self, state):
-        return rearrange(self.net(state), '... (d p) -> ... d p', p = 2)
+        return rearrange(self.net(pad_to_dim(state, self.dim_in)), '... (d p) -> ... d p', p = 2)
 
     def entropy(self, state, actions = None, **kw):
         return self.beta.entropy(self.params(encode_history(self, state, actions, **kw)))
@@ -168,20 +181,21 @@ class DiscreteActor(Module):
         obs_window = 1,
         action_window = 0,
         pad_mode = 'learned',
-        per_slot_pad = True
+        per_slot_pad = True,
+        dim_explorative_latent = 0
     ):
         super().__init__()
         self.num_actions = num_actions
         self.action_noise = action_noise
-        dim_in = init_history(self, dim_state, num_actions, obs_window, action_window, pad_mode, per_slot_pad)
-        self.net = NormedMLP(dim_in, *([dim_hidden] * depth), num_actions, activation = SiLU())
+        self.dim_in = init_history(self, dim_state, num_actions, obs_window, action_window, pad_mode, per_slot_pad) + dim_explorative_latent
+        self.net = NormedMLP(self.dim_in, *([dim_hidden] * depth), num_actions, activation = SiLU())
 
         last_linear = self.net.layers[-1][0]
         init.orthogonal_(last_linear.weight, gain = 0.01)
         init.zeros_(last_linear.bias)
 
     def dist(self, state):
-        return MultiCategorical(self.net(state))
+        return MultiCategorical(self.forward(state))
 
     def entropy(self, state, actions = None, past_actions = None, **kw):
         if exists(past_actions) and not past_actions.is_floating_point():
@@ -202,7 +216,7 @@ class DiscreteActor(Module):
         return F.one_hot(actions.long(), self.num_actions).float()
 
     def forward(self, state):
-        return self.net(state)
+        return self.net(pad_to_dim(state, self.dim_in))
 
 # evaluation and trajectory gif recording
 
@@ -328,6 +342,10 @@ def main(
     state_loss_weight = 150.,
     discount_factor = 0.993,
     entropy_weight = 2e-3,
+    num_explorative_rollouts = 2,
+    dim_explorative_latent = 8,
+    explorative_latent_scale = 0.17,
+    explorative_latent_scale_end = 0.,
     discrete_temperature = 1.,
     discrete_action_noise = 0.05,
     rolling_window = 50,
@@ -363,13 +381,15 @@ def main(
         per_slot_pad = per_slot_pad_embed
     )
 
+    active_latent_dim = dim_explorative_latent if num_explorative_rollouts > 1 else 0
+
     if is_discrete:
         num_actions, dim_action = int(envs[0].action_space.n), None
-        actor = DiscreteActor(dim_state, num_actions, action_noise = discrete_action_noise, **history_kwargs).to(device)
+        actor = DiscreteActor(dim_state, num_actions, action_noise = discrete_action_noise, dim_explorative_latent = active_latent_dim, **history_kwargs).to(device)
     else:
         num_actions, dim_action = None, int(envs[0].action_space.shape[0])
         action_low, action_high = envs[0].action_space.low, envs[0].action_space.high
-        actor = Actor(dim_state, dim_action, bounds = np.stack((action_low, action_high), axis = -1), **history_kwargs).to(device)
+        actor = Actor(dim_state, dim_action, bounds = np.stack((action_low, action_high), axis = -1), dim_explorative_latent = active_latent_dim, **history_kwargs).to(device)
 
     ema_actor = EMA(actor, beta = ema_decay, include_online_model = False, update_after_step = 0, update_every = 1).to(device)
 
@@ -407,7 +427,10 @@ def main(
         action_history = actor.action_history,
         action_smoothness_weight = action_smoothness_weight,
         discount_factor = discount_factor,
-        discrete_action_temperature = discrete_temperature
+        discrete_action_temperature = discrete_temperature,
+        num_explorative_rollouts = num_explorative_rollouts,
+        dim_explorative_latent = active_latent_dim,
+        explorative_latent_scale = explorative_latent_scale
     ).to(device)
 
     # optimizers
@@ -598,7 +621,7 @@ def main(
 
         if prefix_len > 0:
             starts = buffer.sample(max(1, batch_size // 32), filter_fields = real_starts, allow_empty = True, fields = ('state',), device = device)
-            n_starts = starts['state'].shape[0] if exists(starts) else 0
+            n_starts = size(starts['state'], '[b] ...') if exists(starts) else 0
 
             seed = buffer.sample(
                 batch_size - n_starts,
@@ -611,7 +634,7 @@ def main(
             )
 
             initial_states, past_obs, past_actions = seed.state[:, -1], seed.state[:, :-1], seed.action[:, :-1]
-            past_mask = torch.ones((initial_states.shape[0], prefix_len), dtype = torch.bool, device = device)
+            past_mask = torch.ones((size(initial_states, '[b] ...'), prefix_len), dtype = torch.bool, device = device)
 
             if n_starts > 0:
                 initial_states = cat((initial_states, starts['state']), dim = 0)
@@ -627,20 +650,29 @@ def main(
                 device = device
             )['state']
 
+        cur_latent_scale = cosine_anneal(
+            explorative_latent_scale,
+            explorative_latent_scale_end,
+            (iteration - 1) / max(1, num_iterations - 1)
+        )
+
         rollout = supermimic(
             initial_states,
             past_obs = past_obs,
             past_actions = past_actions,
             past_mask = past_mask,
-            num_rollout_timesteps = imagination_horizon
+            num_rollout_timesteps = imagination_horizon,
+            explorative_latent_scale = cur_latent_scale
         )
+
+        past_obs_k, past_actions_k, past_mask_k = repeat_batch((past_obs, past_actions, past_mask), num_explorative_rollouts)
 
         entropy = actor.entropy(
             rollout.states[:, :-1].detach(),
             rollout.actions.detach(),
-            past_obs = past_obs,
-            past_actions = past_actions,
-            past_mask = past_mask
+            past_obs = past_obs_k,
+            past_actions = past_actions_k,
+            past_mask = past_mask_k
         ).mean()
 
         actor_loss = supermimic.actor_loss(

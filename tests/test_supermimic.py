@@ -36,6 +36,9 @@ UNITREE_OBS_NOISE = dict(
 def exists(v):
     return v is not None
 
+def default(v, d):
+    return v if exists(v) else d
+
 def has_grads(module):
     return any(exists(p.grad) for p in module.parameters())
 
@@ -714,3 +717,141 @@ def test_analytic_reward_and_optional_terminal(use_termination_fn):
     assert has_nonzero_grads(actor)
     assert not has_grads(world_model)
     assert not has_grads(critic)
+
+# 8. explorative rollouts (Gladstone et al., 2026)
+
+def test_sample_explorative_latent():
+    from supermimic_pytorch.supermimic import sample_explorative_latent
+
+    # even k: exact (+z, -z) pairs
+    z = rearrange(sample_explorative_latent(3, 4, 8, scale = 0.25), '(b k) d -> b k d', k = 4)
+    assert torch.allclose(z[:, :2], -z[:, 2:])
+
+    # odd k: exact antipodal prefix
+    z_odd = rearrange(sample_explorative_latent(3, 3, 8, scale = 0.25), '(b k) d -> b k d', k = 3)
+    assert torch.allclose(z_odd[:, 0], -z_odd[:, 2])
+
+    # iid disables pairing
+    z_iid = rearrange(sample_explorative_latent(3, 4, 8, antithetic = False, scale = 0.25), '(b k) d -> b k d', k = 4)
+    assert not torch.allclose(z_iid[:, :2], -z_iid[:, 2:])
+
+    # k = 1 or scale = 0 returns zeros
+    assert torch.equal(sample_explorative_latent(3, 1, 4, scale = 0.25), torch.zeros(3, 4))
+    assert torch.equal(sample_explorative_latent(3, 4, 4, scale = 0.), torch.zeros(12, 4))
+
+@pytest.mark.parametrize('dict_state', (False, True))
+@pytest.mark.parametrize('dim_explorative_latent', (1, 4))
+@pytest.mark.parametrize('num_explorative_rollouts', (None, 1, 2, 4))
+def test_explorative_rollouts(dict_state, dim_explorative_latent, num_explorative_rollouts):
+    batch_size = 3
+    horizon = 4
+    dim_state = 10 if dict_state else 6
+    dim_action = 2
+    dim_goal = 4
+
+    def make_state(*leading):
+        if dict_state:
+            return dict(pos = torch.randn(*leading, 4), vel = torch.randn(*leading, 6))
+        return torch.randn(*leading, dim_state)
+
+    world_model = WorldModel(
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True
+    )
+    with torch.no_grad():
+        world_model.to_state_pred.weight.normal_(0., 0.1)
+
+    actor = MLP(dim_state + dim_goal + dim_explorative_latent, 16, dim_action, activation = nn.GELU())
+    critic = Critic(dim_state = dim_state, dim_goal = dim_goal, dim_sim_context = 0, dim_hiddens = (16,))
+
+    supermimic = SuperMimic(
+        actor = actor,
+        world_model = world_model,
+        critic = critic,
+        use_ema_critic = True,
+        num_explorative_rollouts = num_explorative_rollouts,
+        dim_explorative_latent = dim_explorative_latent,
+        explorative_latent_scale = 0.25
+    )
+
+    expected_k = default(num_explorative_rollouts, 2)
+    assert supermimic.num_explorative_rollouts == expected_k
+
+    state = make_state(batch_size)
+    goals = torch.randn(batch_size, horizon + 1, dim_goal)
+
+    rollout = supermimic(state, actor_goals = goals, num_rollout_timesteps = horizon)
+    assert rollout.actions.shape == (batch_size * expected_k, horizon, dim_action)
+    assert rollout.rewards.shape == (batch_size * expected_k, horizon)
+
+    # critic_loss & actor_loss auto-align (b, ...) goals to (b * k, ...)
+    critic_loss = supermimic.critic_loss(rollout.states, rollout.rewards, rollout.terminals, goals = goals)
+    critic_loss.backward()
+    assert has_nonzero_grads(critic)
+    critic.zero_grad()
+
+    final_state = tree_map_tensor(lambda t: t[:, -1], rollout.states)
+    actor_loss = supermimic.actor_loss(
+        rollout.rewards,
+        rollout.terminals,
+        final_state = final_state,
+        final_goal = goals[:, -1]
+    )
+    actor_loss.backward()
+    assert has_nonzero_grads(actor)
+    assert not has_grads(world_model)
+    assert not has_grads(critic)
+
+    # verify turning off per-call with num_explorative_rollouts = 1 restores (b, ...) shapes
+    off_rollout = supermimic(state, actor_goals = goals, num_rollout_timesteps = horizon, num_explorative_rollouts = 1)
+    assert off_rollout.actions.shape == (batch_size, horizon, dim_action)
+
+def test_explorative_humanoid_actor_and_adversarial():
+    from supermimic_pytorch import AdversarialCritic, AdversarialSuperMimic
+
+    world_model = WorldModel(dim_state = 16, dim_action = 4, dim_sim_context = 3, dim_hiddens = (16,), pred_reward = True, pred_terminal = False)
+    actor = HumanoidActor(
+        dim_obs = 16,
+        dim_action = 4,
+        dim_goal = 8,
+        num_obs_frames = 2,
+        num_goal_frames = 2,
+        dim_latent = 8,
+        dim_explorative_latent = 4,
+        dim_hiddens = (16,),
+        dim_velocity_hiddens = (16,)
+    )
+
+    # deployment without explorative_latent defaults cleanly to zeros
+    obs = torch.randn(2, 2, 16)
+    goal = torch.randn(2, 2, 8)
+    assert torch.allclose(actor(obs, goal = goal), actor(obs, goal = goal, explorative_latent = torch.zeros(2, 4)))
+
+    supermimic = SuperMimic(
+        actor = actor,
+        world_model = world_model,
+        obs_history = HistoryWindow(2, pad_mode = 'replicate'),
+        goal_window = HistoryWindow(2, future = True, pad_mode = 'replicate'),
+        dim_explorative_latent = 4,
+        explorative_latent_scale = 0.2
+    )
+    assert supermimic.num_explorative_rollouts == 2
+
+    motion_critic = AdversarialCritic(dim_feature = 16, dim_cond = 3, dim_hiddens = (16,))
+    adv = AdversarialSuperMimic(supermimic, motion_critic = motion_critic, motion_reward_weight = 0.5)
+
+    state = torch.randn(2, 16)
+    sim_context = torch.randn(2, 3)
+    goals = torch.randn(2, 5, 8)
+    rollout = adv(state, sim_context = sim_context, actor_goals = goals, motion_cond = sim_context, num_rollout_timesteps = 3)
+    assert rollout.actions.shape == (4, 3, 4)
+
+    loss = adv.actor_loss(rollout.rewards, sim_context = sim_context)
+    loss.backward()
+    assert has_nonzero_grads(actor)
+    assert not has_grads(world_model)
+    assert not has_grads(motion_critic)

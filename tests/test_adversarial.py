@@ -12,8 +12,11 @@ from supermimic_pytorch import (
     WorldModel
 )
 
+def exists(v):
+    return v is not None
+
 def has_grads(module):
-    return any(p.grad is not None and p.grad.abs().sum() > 0 for p in module.parameters())
+    return any(exists(p.grad) and p.grad.abs().sum() > 0 for p in module.parameters())
 
 @pytest.mark.parametrize('loss_type', ('r3gan', 'lsgan'))
 @pytest.mark.parametrize('detach_motion_reward', (False, True))
@@ -132,7 +135,7 @@ def test_amp_titration():
     # zero weight on forward skips motion / dynamics critics cleanly
 
     r_off = adapter(s0, num_rollout_timesteps = horizon, motion_reward_weight = 0., pessimism_weight = 0.)
-    assert r_off.motion_rewards is None and r_off.realism_rewards is None
+    assert not exists(r_off.motion_rewards) and not exists(r_off.realism_rewards)
     assert torch.allclose(r_off.rewards, r_off.task_rewards)
 
     adapter.actor_loss(r_off.rewards).backward()
@@ -151,5 +154,5 @@ def test_amp_titration():
 
     actions = torch.randn(batch_size, horizon, dim_action)
     next_states = torch.randn(batch_size, horizon, dim_state)
-    assert adapter.world_model_rollout(s0, actions, next_states, world_model_adv_weight = 0.).adv_loss is None
-    assert adapter.world_model_rollout(s0, actions, next_states, world_model_adv_weight = 0.2).adv_loss is not None
+    assert not exists(adapter.world_model_rollout(s0, actions, next_states, world_model_adv_weight = 0.).adv_loss)
+    assert exists(adapter.world_model_rollout(s0, actions, next_states, world_model_adv_weight = 0.2).adv_loss)

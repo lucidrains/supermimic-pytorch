@@ -1,4 +1,5 @@
 from __future__ import annotations
+from math import ceil
 from collections import namedtuple
 from typing import Callable, Literal
 
@@ -6,7 +7,7 @@ import torch
 from torch import Tensor, as_tensor, cat, is_tensor
 from torch.nn import Module, Parameter, Linear, Sequential, Tanh, GELU, Identity
 import torch.nn.functional as F
-from torch.utils._pytree import tree_map
+from torch.utils._pytree import tree_map, tree_leaves
 
 # ein equations
 
@@ -28,7 +29,7 @@ from torch_einops_utils import (
     tree_map_tensor,
     uniform_like
 )
-from torch_einops_utils.shape import assert_shape, size
+from torch_einops_utils.shape import assert_shape, is_shape, shape, size
 
 # mlps
 
@@ -46,6 +47,9 @@ def exists(v):
 
 def default(v, d):
     return v if exists(v) else d
+
+def divisible_by(num, den):
+    return (num % den) == 0
 
 def identity(t):
     return t
@@ -67,7 +71,7 @@ State = Tensor | dict[Name, 'State']
 def state_schema(state: State):
     if is_tensor(state):
         assert state.ndim > 0, 'state leaves must have at least 1 dimension'
-        return state.shape[-1]
+        return size(state, '... [d]')
 
     assert isinstance(state, dict) and len(state) > 0, 'state must be a Tensor or non-empty dict'
     assert all(isinstance(k, str) for k in state.keys()), 'state dict keys must be str'
@@ -85,7 +89,7 @@ def flatten_state_with_inverse(state: State, match = None):
         return state, identity
 
     tensors, unflatten = tree_flatten_with_inverse(state)
-    dims = [t.shape[-1] for t in tensors]
+    dims = [size(t, '... [d]') for t in tensors]
 
     def inverse(t: Tensor):
         return unflatten(t.split(dims, dim = -1))
@@ -97,6 +101,29 @@ def flatten_state_with_inverse(state: State, match = None):
 def flatten_state(state: State, match = None):
     flat, _ = flatten_state_with_inverse(state, match = match)
     return flat
+
+def batch_size_of(tree) -> int:
+    return size(next(t for t in tree_leaves(tree) if is_tensor(t)), '[b] ...')
+
+def repeat_batch(tree, k: int):
+    if k <= 1:
+        return tree
+
+    return tree_map_tensor(lambda t: repeat(t, 'b ... -> (b k) ...', k = k), tree)
+
+def align_batch(tree, target_batch: int):
+    def _align(t: Tensor):
+        if t.ndim == 0:
+            return t
+
+        batch = size(t, '[b] ...')
+        if batch == target_batch:
+            return t
+
+        assert divisible_by(target_batch, batch), f'cannot align batch {batch} to {target_batch}'
+        return repeat(t, 'b ... -> (b k) ...', k = target_batch // batch)
+
+    return tree_map_tensor(_align, tree)
 
 def flatten_window(x: State | None) -> Tensor | None:
     if not exists(x):
@@ -151,11 +178,11 @@ def to_one_hot(indices: Tensor, num_classes: tuple[int, ...], dtype):
     indices = indices.long()
 
     if len(num_classes) == 1:
-        if indices.ndim == 2 and indices.shape[-1] == 1:
+        if is_shape(indices, 'b 1'):
             indices = rearrange(indices, 'b 1 -> b')
         return F.one_hot(indices, num_classes[0]).to(dtype)
 
-    assert indices.ndim >= 2 and indices.shape[-1] == len(num_classes)
+    assert_shape(indices, 'b ... k', k = len(num_classes))
     return cat([F.one_hot(i, n) for i, n in zip(indices.unbind(dim = -1), num_classes)], dim = -1).to(dtype)
 
 # history window & action smoothness
@@ -164,17 +191,17 @@ PadMode = Literal['zero', 'replicate', 'learned']
 
 HistoryCache = namedtuple('HistoryCache', ('frames', 'valid', 'inverse'))
 
-def to_mask(mask: Tensor | None, shape: tuple[int, int], device) -> Tensor:
+def to_mask(mask: Tensor | None, mask_shape: tuple[int, int], device) -> Tensor:
     if not exists(mask):
-        return torch.ones(shape, dtype = torch.bool, device = device)
+        return torch.ones(mask_shape, dtype = torch.bool, device = device)
     mask = pad_right_ndim_to(mask, 2).to(device = device, dtype = torch.bool)
-    assert mask.shape == shape
+    assert mask.shape == mask_shape
     return mask
 
 def to_sequence(tensor: Tensor, mask: Tensor | None = None):
     tensor = rearrange(tensor, 'b d -> b 1 d') if tensor.ndim == 2 else tensor
     assert tensor.ndim == 3
-    return tensor, to_mask(mask, tensor.shape[:2], tensor.device)
+    return tensor, to_mask(mask, shape(tensor, '[b t] d').shape, tensor.device)
 
 class HistoryWindow(Module):
     def __init__(
@@ -229,7 +256,7 @@ class HistoryWindow(Module):
     def unfold(self, tensor: Tensor, pad_value = 0.) -> Tensor:
         pad_fn, slice_fn = (pad_right_at_dim, slice_right_at_dim) if self.future else (pad_left_at_dim, slice_left_at_dim)
         windows = pad_fn(tensor, self.window_size - 1 + self.lag, dim = 1, value = pad_value).unfold(1, self.window_size, 1)
-        return rearrange(slice_fn(windows, tensor.shape[1], dim = 1), 'b t ... w -> b t w ...')
+        return rearrange(slice_fn(windows, size(tensor, 'b [t] ...'), dim = 1), 'b t ... w -> b t w ...')
 
     # streaming
 
@@ -275,7 +302,8 @@ class HistoryWindow(Module):
         flat, frame_mask = to_sequence(flat, mask)
 
         if not exists(cache):
-            cache = self.init_cache(flat.shape[0], flat.shape[-1], device = flat.device, dtype = flat.dtype)
+            batch, dim = shape(flat, '[b] t [d]')
+            cache = self.init_cache(batch, dim, device = flat.device, dtype = flat.dtype)
 
         frames = slice_right_at_dim(cat((cache.frames.to(flat), flat), dim = 1), self.cache_size, dim = 1)
         valid = slice_right_at_dim(cat((cache.valid.to(frame_mask), frame_mask), dim = 1), self.cache_size, dim = 1)
@@ -311,16 +339,16 @@ class HistoryWindow(Module):
     ):
         flat, inverse = flatten_state_with_inverse(inputs)
         seq, seq_mask = to_sequence(flat, mask)
-        seq_len = seq.shape[1]
+        seq_len = size(seq, 'b [t] d')
 
         if exists(episode_starts):
-            episode_starts = to_mask(episode_starts, seq.shape[:2], seq.device)
+            episode_starts = to_mask(episode_starts, shape(seq, '[b t] d').shape, seq.device)
 
         if exists(past):
             past_seq, past_seq_mask = to_sequence(flatten_state(past, match = inverse), past_mask)
             seq, seq_mask = cat((past_seq, seq), dim = 1), cat((past_seq_mask, seq_mask), dim = 1)
             if exists(episode_starts):
-                episode_starts = pad_left_at_dim(episode_starts, past_seq.shape[1], dim = 1, value = False)
+                episode_starts = pad_left_at_dim(episode_starts, size(past_seq, 'b [t] d'), dim = 1, value = False)
 
         windows, valid = self.unfold(seq, 0.), self.unfold(seq_mask, False)
 
@@ -356,6 +384,30 @@ def action_smoothness_penalty(
     squared_diff = reduce(torch.diff(windows, n = order, dim = 2).square(), 'b t 1 d -> b t', 'sum')
     return einx.where('b t, b t, -> b t', valid.all(dim = -1), squared_diff, 0.)
 
+# explorative latent sampling - Gladstone et al. (2026); antithetic pairing - Jia et al. (2025)
+
+def sample_explorative_latent(
+    batch_size: int,
+    num_rollouts: int,
+    dim_latent: int,
+    *,
+    antithetic: bool = True,
+    scale: float = 0.25,
+    device = None,
+    dtype = torch.float32
+) -> Tensor:
+    if num_rollouts <= 1 or scale == 0.:
+        return torch.zeros((batch_size * num_rollouts, dim_latent), device = device, dtype = dtype)
+
+    num_samples = ceil(num_rollouts / 2) if antithetic else num_rollouts
+    z = torch.randn((batch_size, num_samples, dim_latent), device = device, dtype = dtype)
+
+    if antithetic:
+        z = cat((z, -z), dim = 1)[:, :num_rollouts]
+
+    z = z * (scale * (dim_latent ** -0.5))
+    return rearrange(z, 'b k d -> (b k) d')
+
 # actor
 
 class HumanoidActor(Module):
@@ -374,11 +426,14 @@ class HumanoidActor(Module):
         num_action_frames = 0,
         num_goal_frames = 10,
         dim_latent = 32,
+        dim_explorative_latent = 0,
         dim_hiddens = (2048, 1024, 512, 256),
         dim_velocity_hiddens = (256, 256),
         activation = GELU()
     ):
         super().__init__()
+        assert dim_explorative_latent >= 0
+        self.dim_explorative_latent = dim_explorative_latent
 
         dim_obs_history = num_obs_frames * dim_obs + num_action_frames * dim_action
 
@@ -393,7 +448,7 @@ class HumanoidActor(Module):
         )
 
         self.net = MimoMLP(
-            dim_latent + dim_obs_history,
+            dim_latent + dim_obs_history + dim_explorative_latent,
             *dim_hiddens,
             dim_action,
             inputs = (motion_encoder, velocity_encoder, Identity()),
@@ -402,10 +457,11 @@ class HumanoidActor(Module):
 
     def forward(
         self,
-        obs: State,                         # (... num_obs_frames dim_obs) or nested dict
-        goal: State | None = None,          # (... num_goal_frames dim_goal)
-        command = None,                     # (... dim_command) normalized velocity command
-        past_action: Tensor | None = None   # (... num_action_frames dim_action)
+        obs: State,                                # (... num_obs_frames dim_obs) or nested dict
+        goal: State | None = None,                 # (... num_goal_frames dim_goal)
+        command = None,                            # (... dim_command) normalized velocity command
+        past_action: Tensor | None = None,         # (... num_action_frames dim_action)
+        explorative_latent: Tensor | None = None   # (... dim_explorative_latent)
     ):
         is_motion = exists(goal)
         assert is_motion != exists(command), 'pass either goal or command'
@@ -417,9 +473,18 @@ class HumanoidActor(Module):
         velocity_input = (command, obs) if not is_motion else None
         select_inputs = (0 if is_motion else 1, 2)
 
-        # (motion goal, (velocity command, obs history), obs history)
+        policy_obs = obs
 
-        inputs = (goal, velocity_input, obs)
+        if self.dim_explorative_latent > 0:
+            policy_obs = (
+                cat((obs, explorative_latent), dim = -1)
+                if exists(explorative_latent) else
+                pad_right_at_dim(obs, self.dim_explorative_latent, dim = -1)
+            )
+
+        # (motion goal, (velocity command, obs history), obs history [+ explorative latent])
+
+        inputs = (goal, velocity_input, policy_obs)
         return self.net(inputs, select_inputs = select_inputs)
 
 # critic
@@ -735,10 +800,24 @@ class SuperMimic(Module):
         action_smoothness_weight: float = 0.,
         discount_factor = 0.99,
         weight_critic_by_survival = True,
-        discrete_action_temperature = 1.
+        discrete_action_temperature = 1.,
+        num_explorative_rollouts: int | None = None,
+        dim_explorative_latent: int = 0,
+        explorative_latent_scale: float = 0.25,
+        antithetic_explorative_latent: bool = True
     ):
         super().__init__()
         assert not (exists(actor_obs_key) and exists(state_to_obs)), 'pass either `actor_obs_key` or `state_to_obs`'
+
+        # explorative rollouts - Gladstone et al. (2026)
+
+        num_explorative_rollouts = default(num_explorative_rollouts, 2 if dim_explorative_latent > 0 else 1)
+        assert num_explorative_rollouts >= 1 and dim_explorative_latent >= 0
+
+        self.num_explorative_rollouts = num_explorative_rollouts
+        self.dim_explorative_latent = dim_explorative_latent
+        self.explorative_latent_scale = explorative_latent_scale
+        self.antithetic_explorative_latent = antithetic_explorative_latent
 
         self.actor = actor
         self.world_model = world_model
@@ -850,10 +929,13 @@ class SuperMimic(Module):
         states, rewards = flatten_state(states).detach(), rewards.detach()
         pred_terminal = pred_terminal.detach() if exists(pred_terminal) else None
 
+        goals, sim_context, mask = align_batch((goals, sim_context, mask), size(rewards, '[b] t'))
+
         if exists(goals):
             goals = flatten_state(goals)
-            if goals.ndim == 3 and goals.shape[1] > states.shape[1]:
-                goals = goals[:, :states.shape[1]]
+            num_states = size(states, 'b [t] d')
+            if goals.ndim == 3 and size(goals, 'b [t] d') > num_states:
+                goals = goals[:, :num_states]
 
         with torch.no_grad():
             values = self.target_critic(states, goals, sim_context)
@@ -868,19 +950,27 @@ class SuperMimic(Module):
 
     def actor_loss(
         self,
-        rewards,                # (b t)
-        pred_terminal = None,   # (b t)
-        bootstrap_value = None, # (b)
-        final_state: State | None = None,     # (b d)
-        final_goal = None,      # (b g)
-        sim_context = None,     # (b c)
-        actions: State | None = None,         # (b t d_a)
+        rewards,                # (b t) or (b * k t)
+        pred_terminal = None,   # (b t) or (b * k t)
+        bootstrap_value = None, # (b) or (b * k)
+        final_state: State | None = None,     # (b d) or (b * k d)
+        final_goal = None,      # (b g) or (b * k g)
+        sim_context = None,     # (b c) or (b * k c)
+        actions: State | None = None,         # (b t d_a) or (b * k t d_a)
         past_actions: State | None = None,    # (b d_a) or (b p d_a)
         past_mask: Tensor | None = None,      # (b p) or (b,)
         action_smoothness_weight: float | None = None,
-        discount_factor = None
+        discount_factor = None,
+        num_explorative_rollouts: int | None = None
     ):
         discount_factor = default(discount_factor, self.discount_factor)
+        k = default(num_explorative_rollouts, self.num_explorative_rollouts)
+        batch_size = size(rewards, '[b] t')
+
+        sim_context, final_goal, bootstrap_value, past_actions, past_mask = align_batch(
+            (sim_context, final_goal, bootstrap_value, past_actions, past_mask),
+            batch_size
+        )
 
         if exists(pred_terminal):
             assert size(pred_terminal, 'b [t]') == size(rewards, 'b [t]')
@@ -911,7 +1001,13 @@ class SuperMimic(Module):
             rewards, _ = pack([rewards, bootstrap_value], 'b *')
             gates, _ = pack([gates, torch.ones_like(bootstrap_value)], 'b *')
 
-        return -self.assoc_scan(gates, rewards)[:, 0].mean()
+        losses = -self.assoc_scan(gates, rewards)[:, 0]
+
+        if k > 1:
+            assert divisible_by(batch_size, k), f'rewards batch {batch_size} must be divisible by num_explorative_rollouts {k}'
+            losses = reduce(losses, '(b k) -> b', 'min', k = k)
+
+        return losses.mean()
 
     def forward(
         self,
@@ -923,11 +1019,37 @@ class SuperMimic(Module):
         past_obs: State | None = None,
         past_actions: Tensor | None = None,
         past_mask: Tensor | None = None,
-        num_rollout_timesteps = 32
+        num_rollout_timesteps = 32,
+        *,
+        num_explorative_rollouts: int | None = None,
+        explorative_latent_scale: float | None = None
     ):
         actor, world_model = self.actor, self.world_model
+        k = default(num_explorative_rollouts, self.num_explorative_rollouts)
+        assert k >= 1
+
+        orig_batch = batch_size_of(initial_state)
+
+        initial_state, sim_context, actor_goals, actor_cond, references, past_obs, past_actions, past_mask = repeat_batch(
+            (initial_state, sim_context, actor_goals, actor_cond, references, past_obs, past_actions, past_mask),
+            k
+        )
+
         state, inverse_state = flatten_state_with_inverse(initial_state, match = self.observation_noise_schema)
-        batch_size, device, dtype = state.shape[0], state.device, state.dtype
+        batch_size, device, dtype = size(state, '[b] ...'), state.device, state.dtype
+
+        explorative_latent = None
+
+        if self.dim_explorative_latent > 0:
+            explorative_latent = sample_explorative_latent(
+                orig_batch,
+                k,
+                self.dim_explorative_latent,
+                antithetic = self.antithetic_explorative_latent,
+                scale = default(explorative_latent_scale, self.explorative_latent_scale),
+                device = device,
+                dtype = dtype
+            )
 
         if exists(actor_goals) and exists(self.goal_window):
             actor_goals = tree_map_tensor(lambda t: t[:, :num_rollout_timesteps], self.goal_window(actor_goals))
@@ -957,6 +1079,11 @@ class SuperMimic(Module):
         structured = getattr(actor, 'structured_input', False)
         is_latent_wm = hasattr(world_model, 'encode') and hasattr(world_model, 'forward_from_latent')
 
+        if not structured and exists(explorative_latent):
+            actor_cond = safe_cat((actor_cond, explorative_latent), dim = -1)
+
+        explorative_kwarg = dict(explorative_latent = explorative_latent) if exists(explorative_latent) else dict()
+
         with frozen(world_model, eval = True):
             latent = world_model.encode(state) if is_latent_wm else None
 
@@ -977,7 +1104,7 @@ class SuperMimic(Module):
                 actor_goal = tree_map_tensor(lambda x: x[:, t], actor_goals) if exists(actor_goals) else None
 
                 if structured:
-                    action = actor(obs, goal = actor_goal, command = actor_cond, past_action = past_action)
+                    action = actor(obs, goal = actor_goal, command = actor_cond, past_action = past_action, **explorative_kwarg)
                 else:
                     action = actor(compact(
                         flatten_window(obs),

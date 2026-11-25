@@ -16,7 +16,7 @@ from torch_einops_utils import (
     slice_right_at_dim,
     tree_map_detach
 )
-from torch_einops_utils.shape import assert_shape
+from torch_einops_utils.shape import assert_shape, is_shape, size
 
 from x_mlps_pytorch import MLP
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
@@ -25,6 +25,8 @@ from supermimic_pytorch.supermimic import (
     Rollout,
     State,
     SuperMimic,
+    align_batch,
+    batch_size_of,
     default,
     exists,
     flatten_state
@@ -53,7 +55,7 @@ def prepend_state(s0: State, next_states: State) -> State:
     return tree_map(lambda a, b: cat((rearrange(a, 'b ... -> b 1 ...'), b), dim = 1), s0, next_states)
 
 def fit_seq_left(seq: Tensor, length: int, replicate = True) -> Tensor:
-    diff = length - seq.shape[1]
+    diff = length - size(seq, 'b [t] ...')
     if diff <= 0:
         return slice_right_at_dim(seq, length, dim = 1)
     if not replicate:
@@ -63,7 +65,8 @@ def fit_seq_left(seq: Tensor, length: int, replicate = True) -> Tensor:
     return cat((pad, seq), dim = 1)
 
 def to_windows(seq: Tensor, window_size: int) -> Tensor:
-    assert seq.shape[1] >= window_size, f'sequence length {seq.shape[1]} < window_size {window_size}'
+    seq_len = size(seq, 'b [t] ...')
+    assert seq_len >= window_size, f'sequence length {seq_len} < window_size {window_size}'
     return rearrange(seq.unfold(1, window_size, 1), 'b n d w -> b n (w d)')
 
 def align_cond(cond: State, num_windows: int) -> Tensor:
@@ -71,7 +74,8 @@ def align_cond(cond: State, num_windows: int) -> Tensor:
     if cond.ndim == 2:
         return repeat(cond, 'b d -> b n d', n = num_windows)
 
-    assert cond.shape[1] >= num_windows, f'cond length {cond.shape[1]} < {num_windows}'
+    cond_len = size(cond, 'b [t] ...')
+    assert cond_len >= num_windows, f'cond length {cond_len} < {num_windows}'
     return slice_right_at_dim(cond, num_windows, dim = 1)
 
 # zero-centered gradient penalty (R1 / R2, Huang et al. 2025)
@@ -150,7 +154,7 @@ class AdversarialCritic(Module):
             feats = fit_seq_left(feats, horizon + self.window_size - 1, replicate = True)
 
         state_windows = to_windows(feats, self.window_size)
-        num_windows = state_windows.shape[1]
+        num_windows = size(state_windows, 'b [n] d')
 
         action_windows = None
         if self.include_actions:
@@ -171,7 +175,7 @@ class AdversarialCritic(Module):
 
     def score(self, windows: Tensor) -> Tensor:
         logits = self.net(windows)
-        return rearrange(logits, '... 1 -> ...') if logits.ndim == windows.ndim and logits.shape[-1] == 1 else logits
+        return rearrange(logits, '... 1 -> ...') if logits.ndim == windows.ndim and is_shape(logits, '... 1') else logits
 
     def forward(
         self,
@@ -325,13 +329,10 @@ class AdversarialSuperMimic(Module):
         horizon: int | None = None,
         detach: bool = False
     ) -> Tensor:
-        return critic.reward(
-            states,
-            actions = actions if critic.include_actions else None,
-            cond = cond if critic.has_cond else None,
-            horizon = horizon,
-            detach = detach
-        )
+        batch_size = batch_size_of(states)
+        actions = align_batch(actions, batch_size) if critic.include_actions else None
+        cond = align_batch(cond, batch_size) if critic.has_cond else None
+        return critic.reward(states, actions = actions, cond = cond, horizon = horizon, detach = detach)
 
     # world model fit (+ optional real-vs-imagined realism loss)
 
@@ -382,7 +383,7 @@ class AdversarialSuperMimic(Module):
         **kwargs
     ) -> AdversarialRollout:
         rollout = self.supermimic(initial_state, sim_context, *args, **kwargs)
-        horizon = rollout.actions.shape[1]
+        horizon = size(rollout.actions, 'b [t] ...')
 
         task_reward_weight = default(task_reward_weight, self.task_reward_weight)
         motion_reward_weight = default(motion_reward_weight, self.motion_reward_weight)
