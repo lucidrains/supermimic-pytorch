@@ -6,7 +6,7 @@ from torch import Tensor
 from torch.nn import Module, Linear, GELU
 import torch.nn.functional as F
 
-from einops import rearrange
+from einops import rearrange, reduce
 from ema_pytorch import EMA
 from torch_einops_utils import binary_cross_entropy_with_logits, freeze, unfreeze
 from torch_einops_utils.shape import size
@@ -16,9 +16,15 @@ from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
 from supermimic_pytorch.supermimic import (
     State,
+    batch_size_of,
+    default,
     flatten_state,
     flatten_state_with_inverse,
+    reduce_explorative_loss,
+    repeat_batch,
     resolve_action_dim,
+    resolve_explorative_latent,
+    sample_explorative_latent,
     to_one_hot
 )
 
@@ -67,10 +73,24 @@ class LatentWorldModel(Module):
         reward_loss_weight = 1.,
         terminal_loss_weight = 1.,
         ema_decay = 0.999,
-        freeze_autoencoder = True
+        freeze_autoencoder = True,
+        num_explorative_rollouts: int | None = None,
+        dim_explorative_latent: int = 0,
+        explorative_latent_scale: float = 0.25,
+        antithetic_explorative_latent: bool = True
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
+
+        # explorative modeling - Gladstone et al. (2026); antithetic pairing - Jia et al. (2025)
+
+        num_explorative_rollouts = default(num_explorative_rollouts, 2 if dim_explorative_latent > 0 else 1)
+        assert num_explorative_rollouts >= 1 and dim_explorative_latent >= 0
+
+        self.num_explorative_rollouts = num_explorative_rollouts
+        self.dim_explorative_latent = dim_explorative_latent
+        self.explorative_latent_scale = explorative_latent_scale
+        self.antithetic_explorative_latent = antithetic_explorative_latent
 
         dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
         self.dim_action = dim_action
@@ -104,7 +124,7 @@ class LatentWorldModel(Module):
 
         # latent transition backbone
 
-        dim_in = dim_latent + dim_action + dim_sim_context
+        dim_in = dim_latent + dim_action + dim_sim_context + dim_explorative_latent
 
         self.transition_mlp = mlp_klass(dim_in, *dim_hiddens, activation = activation, activate_last = True)
 
@@ -182,20 +202,45 @@ class LatentWorldModel(Module):
         next_states: State,                      # (b time dim_state)
         sim_context: Tensor | None = None,       # (b dim_sim_context)
         next_terminals: Tensor | None = None,    # (b time ...)
-        next_rewards: Tensor | None = None       # (b time ...)
+        next_rewards: Tensor | None = None,      # (b time ...)
+        *,
+        num_explorative_rollouts: int | None = None,
+        explorative_latent_scale: float | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
+        k = default(num_explorative_rollouts, self.num_explorative_rollouts)
+        assert k >= 1
+
+        orig_batch = batch_size_of(state)
+
+        state, actions, next_states, sim_context, next_terminals, next_rewards = repeat_batch(
+            (state, actions, next_states, sim_context, next_terminals, next_rewards),
+            k
+        )
 
         state, inverse_state = flatten_state_with_inverse(state)
         next_states = flatten_state(next_states, match = inverse_state)
 
         latent = self.encode(state)
 
+        explorative_latent = None
+
+        if self.dim_explorative_latent > 0:
+            explorative_latent = sample_explorative_latent(
+                orig_batch,
+                k,
+                self.dim_explorative_latent,
+                antithetic = self.antithetic_explorative_latent,
+                scale = default(explorative_latent_scale, self.explorative_latent_scale),
+                device = latent.device,
+                dtype = latent.dtype
+            )
+
         # accumulants
 
         all_preds = []
         all_losses = []
-        total_loss = 0.
+        total_loss = latent.new_zeros(orig_batch * k)
 
         # latent rollout
 
@@ -217,17 +262,19 @@ class LatentWorldModel(Module):
                 sim_context,
                 next_state,
                 next_terminal,
-                next_reward
+                next_reward,
+                explorative_latent = explorative_latent,
+                reduce_loss = False
             )
 
             total_loss = total_loss + loss
 
             all_preds.append(pred._replace(state = inverse_state(pred.state)))
-            all_losses.append(losses)
+            all_losses.append(Losses(*(t.mean() if exists(t) else None for t in losses)))
 
             latent = pred.latent # feed predicted latent back in
 
-        return total_loss, all_preds, all_losses
+        return reduce_explorative_loss(total_loss, k), all_preds, all_losses
 
     def forward_from_latent(
         self,
@@ -237,7 +284,10 @@ class LatentWorldModel(Module):
         next_state: State | None = None,
         next_terminal: Tensor | None = None,
         next_reward: Tensor | None = None,
-        inverse_state = None
+        inverse_state = None,
+        *,
+        explorative_latent: Tensor | None = None,
+        reduce_loss: bool = True
     ):
         if self.has_discrete_actions and not action.is_floating_point():
             action = to_one_hot(action, self.num_discrete_actions, latent.dtype)
@@ -245,7 +295,9 @@ class LatentWorldModel(Module):
         assert action.ndim == 2, 'use `rollout` for a rollout loss'
         assert self.has_sim_context == exists(sim_context)
 
-        embed = self.transition_mlp(compact(latent, action, sim_context))
+        explorative_latent = resolve_explorative_latent(latent, explorative_latent, self.dim_explorative_latent)
+
+        embed = self.transition_mlp(compact(latent, action, sim_context, explorative_latent))
 
         pred_latent = self.to_latent_pred(embed)
 
@@ -291,34 +343,38 @@ class LatentWorldModel(Module):
         if not need_loss:
             return pred
 
-        total_loss = 0.
+        total_loss = latent.new_zeros(size(latent, '[b] d'))
         state_loss = latent_loss = recon_loss = terminal_loss = reward_loss = None
 
         if exists(next_state):
-            state_loss = F.mse_loss(next_state, pred_next_state)
+            state_loss = reduce(F.mse_loss(next_state, pred_next_state, reduction = 'none'), 'b d -> b', 'mean')
 
             target_latent = self.encode_target(next_state)
-            latent_loss = F.smooth_l1_loss(pred_latent, target_latent)
+            latent_loss = reduce(F.smooth_l1_loss(pred_latent, target_latent, reduction = 'none'), 'b d -> b', 'mean')
 
             total_loss = total_loss + state_loss * self.state_loss_weight + latent_loss * self.latent_loss_weight
 
             # e2e recon, keeps the unfrozen autoencoder honest
 
             if self.has_recon_loss:
-                recon_loss = F.mse_loss(next_state, self.decode(self.encode(next_state)))
+                recon_loss = reduce(F.mse_loss(next_state, self.decode(self.encode(next_state)), reduction = 'none'), 'b d -> b', 'mean')
                 total_loss = total_loss + recon_loss * self.recon_loss_weight
 
         if exists(next_reward):
             assert exists(pred_reward)
-            reward_loss = F.mse_loss(next_reward, pred_reward)
+            reward_loss = F.mse_loss(next_reward, pred_reward, reduction = 'none')
             total_loss = total_loss + reward_loss * self.reward_loss_weight
 
         if exists(next_terminal):
             assert exists(pred_terminal)
-            terminal_loss = binary_cross_entropy_with_logits(pred_terminal_logit, next_terminal)
+            terminal_loss = binary_cross_entropy_with_logits(pred_terminal_logit, next_terminal, reduction = 'none')
             total_loss = total_loss + terminal_loss * self.terminal_loss_weight
 
         losses = Losses(state_loss, latent_loss, recon_loss, terminal_loss, reward_loss)
+
+        if reduce_loss:
+            total_loss = total_loss.mean()
+            losses = Losses(*(t.mean() if exists(t) else None for t in losses))
 
         return total_loss, pred, losses
 
@@ -329,7 +385,10 @@ class LatentWorldModel(Module):
         sim_context: Tensor | None = None,      # (b dim_sim_context)
         next_state: State | None = None,
         next_terminal: Tensor | None = None,
-        next_reward: Tensor | None = None
+        next_reward: Tensor | None = None,
+        *,
+        explorative_latent: Tensor | None = None,
+        reduce_loss: bool = True
     ):
         state, inverse_state = flatten_state_with_inverse(state)
         latent = self.encode(state)
@@ -341,5 +400,7 @@ class LatentWorldModel(Module):
             next_state,
             next_terminal,
             next_reward,
-            inverse_state = inverse_state
+            inverse_state = inverse_state,
+            explorative_latent = explorative_latent,
+            reduce_loss = reduce_loss
         )

@@ -346,6 +346,12 @@ def main(
     dim_explorative_latent = 8,
     explorative_latent_scale = 0.17,
     explorative_latent_scale_end = 0.,
+    wm_num_explorative_rollouts: int | None = None,
+    wm_dim_explorative_latent = 0,
+    wm_explorative_latent_scale = 0.25,
+    wm_explorative_latent_scale_end = 0.,
+    wm_antithetic_explorative_latent = True,
+    wm_imag_explorative_latent_scale = 0.,
     discrete_temperature = 1.,
     discrete_action_noise = 0.05,
     rolling_window = 50,
@@ -382,6 +388,8 @@ def main(
     )
 
     active_latent_dim = dim_explorative_latent if num_explorative_rollouts > 1 else 0
+    wm_k = default(wm_num_explorative_rollouts, 2 if wm_dim_explorative_latent > 0 else 1)
+    active_wm_latent_dim = wm_dim_explorative_latent if wm_k > 1 else 0
 
     if is_discrete:
         num_actions, dim_action = int(envs[0].action_space.n), None
@@ -404,7 +412,11 @@ def main(
         pred_residual_state = True,
         pred_terminal = True,
         pred_reward = True,
-        state_loss_weight = state_loss_weight
+        state_loss_weight = state_loss_weight,
+        num_explorative_rollouts = wm_k,
+        dim_explorative_latent = active_wm_latent_dim,
+        explorative_latent_scale = wm_explorative_latent_scale,
+        antithetic_explorative_latent = wm_antithetic_explorative_latent
     ).to(device)
 
     critic = Critic(
@@ -430,7 +442,8 @@ def main(
         discrete_action_temperature = discrete_temperature,
         num_explorative_rollouts = num_explorative_rollouts,
         dim_explorative_latent = active_latent_dim,
-        explorative_latent_scale = explorative_latent_scale
+        explorative_latent_scale = explorative_latent_scale,
+        wm_explorative_latent_scale = wm_imag_explorative_latent_scale
     ).to(device)
 
     # optimizers
@@ -541,7 +554,7 @@ def main(
 
     # world model update helper
 
-    def update_world_model(num_updates: int):
+    def update_world_model(num_updates: int, latent_scale: float | None = None):
         r_stats = buffer.field_stats('reward', filter_fields = real_only)
         reward_scale = tensor(max(r_stats.rms, 1e-2) if r_stats.count >= 64 else 1., dtype = torch.float32, device = device)
 
@@ -559,7 +572,8 @@ def main(
                 batch.action,
                 batch.next_state,
                 next_terminals = batch.terminal,
-                next_rewards = batch.reward / reward_scale
+                next_rewards = batch.reward / reward_scale,
+                explorative_latent_scale = latent_scale
             )
 
             world_model_opt.zero_grad()
@@ -577,9 +591,12 @@ def main(
     # training iterations
 
     for iteration in range(1, num_iterations + 1):
+        frac = (iteration - 1) / max(1, num_iterations - 1)
+        cur_wm_latent_scale = cosine_anneal(wm_explorative_latent_scale, wm_explorative_latent_scale_end, frac)
+
         collect_env_steps(env_steps_per_iter)
 
-        reward_scale = update_world_model(wm_updates_per_iter)
+        reward_scale = update_world_model(wm_updates_per_iter, latent_scale = cur_wm_latent_scale)
 
         # update critic on real replay sequences
 
@@ -650,11 +667,7 @@ def main(
                 device = device
             )['state']
 
-        cur_latent_scale = cosine_anneal(
-            explorative_latent_scale,
-            explorative_latent_scale_end,
-            (iteration - 1) / max(1, num_iterations - 1)
-        )
+        cur_latent_scale = cosine_anneal(explorative_latent_scale, explorative_latent_scale_end, frac)
 
         rollout = supermimic(
             initial_states,

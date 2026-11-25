@@ -607,6 +607,12 @@ def train_supermimic_tracker(
     dim_explorative_latent = 4,
     explorative_latent_scale = 0.28,
     explorative_latent_scale_end = 0.03,
+    wm_num_explorative_rollouts: int | None = None,
+    wm_dim_explorative_latent = 0,
+    wm_explorative_latent_scale = 0.25,
+    wm_explorative_latent_scale_end = 0.,
+    wm_antithetic_explorative_latent = True,
+    wm_imag_explorative_latent_scale = 0.,
     amp_weight = 0.,
     amp_every = 4,
     amp_prob = 1.,
@@ -625,6 +631,8 @@ def train_supermimic_tracker(
     policy_updates = 4
     batch_size = 256
     active_latent_dim = dim_explorative_latent if num_explorative_rollouts > 1 else 0
+    wm_k = default(wm_num_explorative_rollouts, 2 if wm_dim_explorative_latent > 0 else 1)
+    active_wm_latent_dim = wm_dim_explorative_latent if wm_k > 1 else 0
 
     with (
         MocapEnvs(dataset, 'train', device, num_envs = num_envs, horizon = 128) as train_envs,
@@ -649,7 +657,11 @@ def train_supermimic_tracker(
             normed_mlp = True,
             pred_residual_state = True,
             pred_reward = False,
-            pred_terminal = False
+            pred_terminal = False,
+            num_explorative_rollouts = wm_k,
+            dim_explorative_latent = active_wm_latent_dim,
+            explorative_latent_scale = wm_explorative_latent_scale,
+            antithetic_explorative_latent = wm_antithetic_explorative_latent
         ).to(device)
 
         critic = Critic(
@@ -680,7 +692,8 @@ def train_supermimic_tracker(
             discount_factor = 0.99,
             num_explorative_rollouts = num_explorative_rollouts,
             dim_explorative_latent = active_latent_dim,
-            explorative_latent_scale = explorative_latent_scale
+            explorative_latent_scale = explorative_latent_scale,
+            wm_explorative_latent_scale = wm_imag_explorative_latent_scale
         ).to(device)
 
         motion_critic = motion_critic_opt = norm_train_states = None
@@ -760,13 +773,18 @@ def train_supermimic_tracker(
                     if dones.any():
                         train_policy.reset(as_tensor(dones, device = device))
 
-        def fit_world_model(num_updates: int) -> float:
+        def fit_world_model(num_updates: int, latent_scale: float | None = None) -> float:
             world_model.train()
             fields = ('state', 'action', 'next_state')
 
             for _ in range(num_updates):
                 batch = buffer.sample(batch_size, horizon = wm_horizon, to_named_tuple = fields, device = device)
-                wm_loss, _, _ = world_model.rollout(batch.state[:, 0], batch.action, batch.next_state)
+                wm_loss, _, _ = world_model.rollout(
+                    batch.state[:, 0],
+                    batch.action,
+                    batch.next_state,
+                    explorative_latent_scale = latent_scale
+                )
                 loss = wm_loss / wm_horizon
                 step_optimizer(world_model_opt, loss, world_model.parameters())
 
@@ -805,17 +823,16 @@ def train_supermimic_tracker(
         for iteration in range(1, num_iterations + 1):
             # collect on-policy transitions and refit world model
 
+            frac = (iteration - 1) / max(1, num_iterations - 1)
+            cur_wm_latent_scale = cosine_anneal(wm_explorative_latent_scale, wm_explorative_latent_scale_end, frac)
+
             collect_steps(16)
-            wm_loss = fit_world_model(10)
+            wm_loss = fit_world_model(10, latent_scale = cur_wm_latent_scale)
 
             # imagine through frozen world model and update actor via bptt
 
             actor.train()
-            cur_latent_scale = cosine_anneal(
-                explorative_latent_scale,
-                explorative_latent_scale_end,
-                (iteration - 1) / max(1, num_iterations - 1)
-            )
+            cur_latent_scale = cosine_anneal(explorative_latent_scale, explorative_latent_scale_end, frac)
 
             for update_idx in range(policy_updates):
                 global_update = (iteration - 1) * policy_updates + update_idx + 1
@@ -1125,6 +1142,12 @@ def main(
     dim_explorative_latent = 4,
     explorative_latent_scale = 0.28,
     explorative_latent_scale_end = 0.03,
+    wm_num_explorative_rollouts: int | None = None,
+    wm_dim_explorative_latent = 0,
+    wm_explorative_latent_scale = 0.25,
+    wm_explorative_latent_scale_end = 0.,
+    wm_antithetic_explorative_latent = True,
+    wm_imag_explorative_latent_scale = 0.,
     amp_weight = 0.,
     amp_every = 4,
     amp_prob = 1.,
@@ -1166,6 +1189,12 @@ def main(
         dim_explorative_latent = dim_explorative_latent,
         explorative_latent_scale = explorative_latent_scale,
         explorative_latent_scale_end = explorative_latent_scale_end,
+        wm_num_explorative_rollouts = wm_num_explorative_rollouts,
+        wm_dim_explorative_latent = wm_dim_explorative_latent,
+        wm_explorative_latent_scale = wm_explorative_latent_scale,
+        wm_explorative_latent_scale_end = wm_explorative_latent_scale_end,
+        wm_antithetic_explorative_latent = wm_antithetic_explorative_latent,
+        wm_imag_explorative_latent_scale = wm_imag_explorative_latent_scale,
         amp_weight = amp_weight,
         amp_every = amp_every,
         amp_prob = amp_prob,

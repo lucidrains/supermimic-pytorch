@@ -236,3 +236,51 @@ def test_latent_world_model_dict_state():
     swapped = {'observation': next_state['observation'], 'state': next_state['state']}
     with pytest.raises(AssertionError):
         world_model(state, action, sim_context, swapped)
+
+def test_explorative_latent_world_model():
+    world_model = LatentWorldModel(
+        state_encoder = nn.Sequential(MLP(8, 16, 6), nn.Tanh()),
+        state_decoder = MLP(6, 16, 8),
+        dim_action = 2,
+        dim_sim_context = 0,
+        dim_latent = 6,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        dim_explorative_latent = 4,
+        explorative_latent_scale = 0.25
+    )
+    assert world_model.num_explorative_rollouts == 2
+
+    state = torch.randn(3, 8)
+    actions = torch.randn(3, 4, 2)
+    next_states = torch.randn(3, 4, 8)
+    next_terminals = torch.randint(0, 2, (3, 4)).float()
+    next_rewards = torch.randn(3, 4)
+
+    # zero-latent default at inference
+    pred_default = world_model(state, actions[:, 0])
+    pred_zero = world_model(state, actions[:, 0], explorative_latent = torch.zeros(3, 4))
+    assert torch.allclose(pred_default.state, pred_zero.state)
+
+    # rollout loss & gradients
+    loss, preds, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+    assert preds[-1].state.shape == (6, 8)
+    loss.backward()
+    assert has_grads(world_model.transition_mlp)
+    world_model.zero_grad()
+
+    # scale = 0 matches k = 1
+    with torch.no_grad():
+        loss_zero, _, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards, explorative_latent_scale = 0.)
+        loss_k1, _, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards, num_explorative_rollouts = 1)
+    assert torch.allclose(loss_zero, loss_k1, atol = 1e-6)
+
+    # SuperMimic BPTT with wm_explorative_latent_scale
+    actor = MLP(8, 16, 2, activation = nn.GELU())
+    supermimic = SuperMimic(actor = actor, world_model = world_model, wm_explorative_latent_scale = 0.25)
+    rollout = supermimic(state, num_rollout_timesteps = 3)
+    actor_loss = supermimic.actor_loss(rollout.rewards, rollout.terminals)
+    actor_loss.backward()
+    assert has_grads(actor)
+    assert not has_grads(world_model)

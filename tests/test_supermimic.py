@@ -855,3 +855,102 @@ def test_explorative_humanoid_actor_and_adversarial():
     assert has_nonzero_grads(actor)
     assert not has_grads(world_model)
     assert not has_grads(motion_critic)
+
+@pytest.mark.parametrize('dict_state', (False, True))
+@pytest.mark.parametrize('dim_explorative_latent', (1, 4))
+@pytest.mark.parametrize('num_explorative_rollouts', (None, 1, 2, 4))
+@pytest.mark.parametrize('antithetic', (True, False))
+def test_explorative_world_model(dict_state, dim_explorative_latent, num_explorative_rollouts, antithetic):
+    from supermimic_pytorch.supermimic import flatten_state
+
+    batch_size = 3
+    horizon = 4
+    dim_state = 10 if dict_state else 6
+    dim_action = 2
+
+    def make_state(*leading):
+        if dict_state:
+            return dict(pos = torch.randn(*leading, 4), vel = torch.randn(*leading, 6))
+        return torch.randn(*leading, dim_state)
+
+    world_model = WorldModel(
+        dim_state = dim_state,
+        dim_action = dim_action,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        num_explorative_rollouts = num_explorative_rollouts,
+        dim_explorative_latent = dim_explorative_latent,
+        explorative_latent_scale = 0.25,
+        antithetic_explorative_latent = antithetic
+    )
+    with torch.no_grad():
+        world_model.to_state_pred.weight.normal_(0., 0.1)
+
+    expected_k = default(num_explorative_rollouts, 2)
+    assert world_model.num_explorative_rollouts == expected_k
+
+    state = make_state(batch_size)
+    actions = torch.randn(batch_size, horizon, dim_action)
+    next_states = make_state(batch_size, horizon)
+    next_terminals = torch.randint(0, 2, (batch_size, horizon)).float()
+    next_rewards = torch.randn(batch_size, horizon)
+
+    # deployment without explorative_latent defaults cleanly to zeros
+    pred_default = world_model(state, actions[:, 0])
+    pred_zero = world_model(state, actions[:, 0], explorative_latent = torch.zeros(batch_size, dim_explorative_latent))
+    assert torch.allclose(flatten_state(pred_default.state), flatten_state(pred_zero.state))
+
+    # rollout loss & gradients
+    loss, preds, losses = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+    assert loss.ndim == 0
+    assert len(preds) == horizon and len(losses) == horizon
+    assert flatten_state(preds[-1].state).shape == (batch_size * expected_k, dim_state)
+
+    loss.backward()
+    assert has_nonzero_grads(world_model)
+    world_model.zero_grad()
+
+    # scale = 0 matches k = 1 exactly
+    with torch.no_grad():
+        loss_zero, _, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards, explorative_latent_scale = 0.)
+        loss_k1, preds_k1, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards, num_explorative_rollouts = 1)
+    assert torch.allclose(loss_zero, loss_k1, atol = 1e-6)
+    assert flatten_state(preds_k1[-1].state).shape == (batch_size, dim_state)
+
+def test_supermimic_wm_explorative_latent():
+    world_model = WorldModel(
+        dim_state = 6,
+        dim_action = 2,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        dim_explorative_latent = 4,
+        explorative_latent_scale = 0.25
+    )
+    with torch.no_grad():
+        world_model.to_state_pred.weight.normal_(0., 0.1)
+
+    actor = MLP(6, 16, 2, activation = nn.GELU())
+    supermimic = SuperMimic(
+        actor = actor,
+        world_model = world_model,
+        num_explorative_rollouts = 2,
+        dim_explorative_latent = 0,
+        wm_explorative_latent_scale = 0.25
+    )
+
+    state = torch.randn(3, 6)
+    rollout = supermimic(state, num_rollout_timesteps = 4)
+    assert rollout.states.shape == (6, 5, 6)
+
+    # wm_latent is shared across the k actor rollouts -> identical trajectories when actor has no latent
+    states_bk = rearrange(rollout.states, '(b k) t d -> b k t d', k = 2)
+    assert torch.allclose(states_bk[:, 0], states_bk[:, 1])
+
+    actor_loss = supermimic.actor_loss(rollout.rewards, rollout.terminals)
+    actor_loss.backward()
+    assert has_nonzero_grads(actor)
+    assert not has_grads(world_model)

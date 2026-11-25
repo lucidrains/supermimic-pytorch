@@ -94,6 +94,16 @@ $ uv run train_ruka_hand.py
 
 <img src="./assets/ruka/ruka_convergence.png" width="500px"></img>
 
+[Unitree Go2](https://github.com/google-deepmind/mujoco_menagerie/tree/main/unitree_go2) quadruped experiment - tracks held-out real German Shepherd motion capture under MuJoCo rigid-body ground contact physics
+
+```bash
+$ uv run train_unitree_dog.py
+```
+
+<img src="./assets/go2/dog_vs_go2_supermimic.webp" width="700px"></img>
+
+<img src="./assets/go2/go2_convergence.png" width="500px"></img>
+
 ## Citations
 
 ```bibtex
@@ -189,5 +199,18 @@ $ uv run train_ruka_hand.py
     archivePrefix = {arXiv},
     primaryClass = {cs.RO},
     url     = {https://arxiv.org/abs/2603.26660},
+}
+```
+
+```bibtex
+@inproceedings{peng2020learningagileroboticlocomotion,
+    title     = {Learning Agile Robotic Locomotion Skills by Imitating Animals},
+    author    = {Xue Bin Peng and Erwin Coumans and Tingnan Zhang and Tsang-Wei Edward Lee and Jie Tan and Sergey Levine},
+    booktitle = {Robotics: Science and Systems (RSS)},
+    year      = {2020},
+    eprint    = {2004.00784},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url       = {https://arxiv.org/abs/2004.00784},
 }
 ```

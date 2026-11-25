@@ -408,6 +408,23 @@ def sample_explorative_latent(
     z = z * (scale * (dim_latent ** -0.5))
     return rearrange(z, 'b k d -> (b k) d')
 
+def resolve_explorative_latent(ref: Tensor, explorative_latent: Tensor | None, dim_latent: int) -> Tensor | None:
+    if dim_latent <= 0:
+        return None
+
+    batch = size(ref, '[b] ...')
+    if exists(explorative_latent):
+        assert_shape(explorative_latent, 'b d', b = batch, d = dim_latent)
+        return explorative_latent
+
+    return ref.new_zeros((batch, dim_latent))
+
+def reduce_explorative_loss(losses: Tensor, k: int) -> Tensor:
+    if k > 1:
+        assert divisible_by(size(losses, '[b]'), k), f'batch {size(losses, "[b]")} must be divisible by num_explorative_rollouts {k}'
+        losses = reduce(losses, '(b k) -> b', 'min', k = k)
+    return losses.mean()
+
 # actor
 
 class HumanoidActor(Module):
@@ -598,10 +615,24 @@ class WorldModel(Module):
         terminal_init_bias = -4.,
         state_loss_weight = 1.,
         reward_loss_weight = 1.,
-        terminal_loss_weight = 1.
+        terminal_loss_weight = 1.,
+        num_explorative_rollouts: int | None = None,
+        dim_explorative_latent: int = 0,
+        explorative_latent_scale: float = 0.25,
+        antithetic_explorative_latent: bool = True
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
+
+        # explorative modeling - Gladstone et al. (2026); antithetic pairing - Jia et al. (2025)
+
+        num_explorative_rollouts = default(num_explorative_rollouts, 2 if dim_explorative_latent > 0 else 1)
+        assert num_explorative_rollouts >= 1 and dim_explorative_latent >= 0
+
+        self.num_explorative_rollouts = num_explorative_rollouts
+        self.dim_explorative_latent = dim_explorative_latent
+        self.explorative_latent_scale = explorative_latent_scale
+        self.antithetic_explorative_latent = antithetic_explorative_latent
 
         dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
         self.dim_action = dim_action
@@ -609,7 +640,7 @@ class WorldModel(Module):
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
-        dim_in = dim_state + dim_action + dim_sim_context
+        dim_in = dim_state + dim_action + dim_sim_context + dim_explorative_latent
 
         # backbone
 
@@ -650,18 +681,43 @@ class WorldModel(Module):
         next_states: State,                      # (b time ...)
         sim_context: Tensor | None = None,       # (b dim_sim_context)
         next_terminals: Tensor | None = None,    # (b time ...)
-        next_rewards: Tensor | None = None       # (b time ...)
+        next_rewards: Tensor | None = None,      # (b time ...)
+        *,
+        num_explorative_rollouts: int | None = None,
+        explorative_latent_scale: float | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
+        k = default(num_explorative_rollouts, self.num_explorative_rollouts)
+        assert k >= 1
+
+        orig_batch = batch_size_of(state)
+
+        state, actions, next_states, sim_context, next_terminals, next_rewards = repeat_batch(
+            (state, actions, next_states, sim_context, next_terminals, next_rewards),
+            k
+        )
 
         state, inverse_state = flatten_state_with_inverse(state)
         next_states = flatten_state(next_states, match = inverse_state)
+
+        explorative_latent = None
+
+        if self.dim_explorative_latent > 0:
+            explorative_latent = sample_explorative_latent(
+                orig_batch,
+                k,
+                self.dim_explorative_latent,
+                antithetic = self.antithetic_explorative_latent,
+                scale = default(explorative_latent_scale, self.explorative_latent_scale),
+                device = state.device,
+                dtype = state.dtype
+            )
 
         # accumulants
 
         all_preds = []
         all_losses = []
-        total_loss = 0.
+        total_loss = state.new_zeros(orig_batch * k)
 
         # rollout across timesteps
 
@@ -683,17 +739,19 @@ class WorldModel(Module):
                 sim_context,
                 next_state,
                 next_terminal,
-                next_reward
+                next_reward,
+                explorative_latent = explorative_latent,
+                reduce_loss = False
             )
 
             total_loss = total_loss + loss
 
             all_preds.append(pred._replace(state = inverse_state(pred.state)))
-            all_losses.append(losses)
+            all_losses.append(Losses(*(t.mean() if exists(t) else None for t in losses)))
 
             state = pred.state # feed prediction back in
 
-        return total_loss, all_preds, all_losses
+        return reduce_explorative_loss(total_loss, k), all_preds, all_losses
 
     def forward(
         self,
@@ -702,7 +760,10 @@ class WorldModel(Module):
         sim_context: Tensor | None = None,      # (b dim_sim_context)
         next_state: State | None = None,
         next_terminal: Tensor | None = None,
-        next_reward: Tensor | None = None
+        next_reward: Tensor | None = None,
+        *,
+        explorative_latent: Tensor | None = None,
+        reduce_loss: bool = True
     ):
         state, inverse_state = flatten_state_with_inverse(state)
 
@@ -712,10 +773,11 @@ class WorldModel(Module):
         assert action.ndim == 2, 'use `rollout` for a rollout loss'
         assert self.has_sim_context == exists(sim_context)
 
-        # world model is just a forward dynamics model f(s, a) -> s'
-        # with simulation context (domain randomization presumably)
+        explorative_latent = resolve_explorative_latent(state, explorative_latent, self.dim_explorative_latent)
 
-        embed = self.transition_mlp(compact(state, action, sim_context))
+        # world model is just a forward dynamics model f(s, a, [xi, z]) -> s'
+
+        embed = self.transition_mlp(compact(state, action, sim_context, explorative_latent))
 
         # whether predicting residual state or not
 
@@ -752,25 +814,29 @@ class WorldModel(Module):
         if not need_loss:
             return pred
 
-        total_loss = 0.
+        total_loss = state.new_zeros(size(state, '[b] d'))
         state_loss = reward_loss = terminal_loss = None
 
         if exists(next_state):
             next_state = flatten_state(next_state, match = inverse_state)
-            state_loss = F.mse_loss(next_state, pred_next_state)
+            state_loss = reduce(F.mse_loss(next_state, pred_next_state, reduction = 'none'), 'b d -> b', 'mean')
             total_loss = total_loss + state_loss * self.state_loss_weight
 
         if exists(next_reward):
             assert exists(pred_reward)
-            reward_loss = F.mse_loss(next_reward, pred_reward)
+            reward_loss = F.mse_loss(next_reward, pred_reward, reduction = 'none')
             total_loss = total_loss + reward_loss * self.reward_loss_weight
 
         if exists(next_terminal):
             assert exists(pred_terminal)
-            terminal_loss = binary_cross_entropy_with_logits(pred_terminal_logit, next_terminal)
+            terminal_loss = binary_cross_entropy_with_logits(pred_terminal_logit, next_terminal, reduction = 'none')
             total_loss = total_loss + terminal_loss * self.terminal_loss_weight
 
         losses = Losses(state_loss, terminal_loss, reward_loss)
+
+        if reduce_loss:
+            total_loss = total_loss.mean()
+            losses = Losses(*(t.mean() if exists(t) else None for t in losses))
 
         return total_loss, pred, losses
 
@@ -804,7 +870,8 @@ class SuperMimic(Module):
         num_explorative_rollouts: int | None = None,
         dim_explorative_latent: int = 0,
         explorative_latent_scale: float = 0.25,
-        antithetic_explorative_latent: bool = True
+        antithetic_explorative_latent: bool = True,
+        wm_explorative_latent_scale: float = 0.
     ):
         super().__init__()
         assert not (exists(actor_obs_key) and exists(state_to_obs)), 'pass either `actor_obs_key` or `state_to_obs`'
@@ -818,6 +885,7 @@ class SuperMimic(Module):
         self.dim_explorative_latent = dim_explorative_latent
         self.explorative_latent_scale = explorative_latent_scale
         self.antithetic_explorative_latent = antithetic_explorative_latent
+        self.wm_explorative_latent_scale = wm_explorative_latent_scale
 
         self.actor = actor
         self.world_model = world_model
@@ -1002,12 +1070,7 @@ class SuperMimic(Module):
             gates, _ = pack([gates, torch.ones_like(bootstrap_value)], 'b *')
 
         losses = -self.assoc_scan(gates, rewards)[:, 0]
-
-        if k > 1:
-            assert divisible_by(batch_size, k), f'rewards batch {batch_size} must be divisible by num_explorative_rollouts {k}'
-            losses = reduce(losses, '(b k) -> b', 'min', k = k)
-
-        return losses.mean()
+        return reduce_explorative_loss(losses, k)
 
     def forward(
         self,
@@ -1022,7 +1085,8 @@ class SuperMimic(Module):
         num_rollout_timesteps = 32,
         *,
         num_explorative_rollouts: int | None = None,
-        explorative_latent_scale: float | None = None
+        explorative_latent_scale: float | None = None,
+        wm_explorative_latent_scale: float | None = None
     ):
         actor, world_model = self.actor, self.world_model
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
@@ -1084,6 +1148,14 @@ class SuperMimic(Module):
 
         explorative_kwarg = dict(explorative_latent = explorative_latent) if exists(explorative_latent) else dict()
 
+        wm_dim_latent = getattr(world_model, 'dim_explorative_latent', 0)
+        wm_latent_scale = default(wm_explorative_latent_scale, self.wm_explorative_latent_scale)
+        wm_explorative_kwarg = dict()
+
+        if wm_dim_latent > 0 and wm_latent_scale > 0.:
+            wm_latent = torch.randn((orig_batch, wm_dim_latent), device = device, dtype = dtype) * (wm_latent_scale * (wm_dim_latent ** -0.5))
+            wm_explorative_kwarg = dict(explorative_latent = repeat_batch(wm_latent, k))
+
         with frozen(world_model, eval = True):
             latent = world_model.encode(state) if is_latent_wm else None
 
@@ -1126,10 +1198,10 @@ class SuperMimic(Module):
                     act_cache = self.action_history.push(action, act_cache)
 
                 if is_latent_wm:
-                    pred = world_model.forward_from_latent(latent, action, sim_context)
+                    pred = world_model.forward_from_latent(latent, action, sim_context, **wm_explorative_kwarg)
                     latent = pred.latent
                 else:
-                    pred = world_model(state, action, sim_context)
+                    pred = world_model(state, action, sim_context, **wm_explorative_kwarg)
 
                 state = pred.state
                 states.append(state)
