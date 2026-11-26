@@ -126,17 +126,20 @@ class WelfordNormalizer(Module):
         eps: float = 1e-5,
         min_std: float | Tensor | dict | None = 1e-2,
         min_count: int = 2,
+        max_count: float | None = None,
         subset = None,
         exclude = None,
         dtype: torch.dtype = torch.float32
     ):
         super().__init__()
         assert min_count >= 1, '`min_count` must be >= 1'
+        assert not exists(max_count) or max_count >= min_count, '`max_count` must be >= `min_count`'
         assert exists(dim) or not (exists(subset) or exists(exclude)), '`subset` / `exclude` requires a feature `dim`'
 
         self.dim = dim
         self.eps = eps
         self.min_count = min_count
+        self.max_count = float(max_count) if exists(max_count) else None
         self.subset = subset
         self.exclude = exclude
         self.stats_dtype = dtype
@@ -257,6 +260,9 @@ class WelfordNormalizer(Module):
         _, std = self._stats(self.mean.device, self.mean.dtype)
         return std
 
+    def stats(self) -> tuple[Tensor, Tensor]:
+        return self._stats(self.mean.device, self.mean.dtype)
+
     @torch.no_grad()
     def reset(self):
         self.mean.zero_()
@@ -310,6 +316,11 @@ class WelfordNormalizer(Module):
             self.m2.to(flat.device, flat.dtype),
             batch_count, batch_mean, batch_m2
         )
+
+        if exists(self.max_count):
+            cap = count.clamp_max(self.max_count)
+            m2 = m2 * (cap / count.clamp_min(1.))
+            count = cap
 
         if exists(self.subset_mask):
             mask = self.subset_mask.to(flat.device)

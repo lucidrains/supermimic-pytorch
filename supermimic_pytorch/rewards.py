@@ -170,6 +170,35 @@ def weighted_reduce(t: Tensor, weights: Tensor | None, mode = 'sum') -> Tensor:
         return einsum(t, weights.to(t), '... d, d -> ...')
     return reduce(t, '... d -> ...', mode)
 
+def masked_weighted_reduce(t: Tensor, mask: Tensor, weights: Tensor | None = None, mode = 'sum') -> tuple[Tensor, Tensor]:
+    mask = mask.to(t)
+
+    if mask.shape[-1] == 1 and t.shape[-1] > 1:
+        active = (rearrange(mask, '... 1 -> ...') > 0).to(t)
+        return weighted_reduce(t, weights, mode), active
+
+    w = mask * weights.to(t) if exists(weights) else mask
+    w_sum = reduce(w, '... d -> ...', 'sum')
+    active = (w_sum > 0).to(t)
+
+    if exists(weights):
+        scale = weights.to(t).sum() if mode == 'sum' else 1.
+    else:
+        scale = float(t.shape[-1]) if mode == 'sum' else 1.
+
+    val = reduce(t * w, '... d -> ...', 'sum') * (scale / w_sum.clamp(min = 1e-8))
+    return val, active
+
+def select_optional(tree: State, key) -> Tensor | None:
+    if not exists(key):
+        return None
+    if isinstance(key, str):
+        return tree.get(key) if isinstance(tree, dict) else None
+    try:
+        return select(tree, key)
+    except (KeyError, AssertionError):
+        return None
+
 def default_term_name(obj, fallback: str) -> str:
     name = obj if isinstance(obj, str) else getattr(obj, 'name', None) or getattr(obj, '__name__', None)
     return name if exists(name) and name != '<lambda>' else fallback
@@ -197,6 +226,7 @@ class TrackingTerm(Module):
         key = None,
         *,
         ref_key = None,
+        mask_key = None,
         metric = 'l2',
         std = 1.,
         scale = None,
@@ -216,6 +246,7 @@ class TrackingTerm(Module):
 
         self.key = key
         self.ref_key = ref_key
+        self.mask_key = mask_key
         self.metric = metric
         self.kernel = kernel
         self.weight = float(weight)
@@ -232,22 +263,39 @@ class TrackingTerm(Module):
         self.register_buffer('item_weights', item_weights)
         self.register_buffer('dim_weights', dim_weights)
 
-    def forward(self, states: State, references: State = None, **kwargs) -> Tensor:
+    def forward(self, states: State, references: State = None, *, return_active = False, **kwargs) -> Tensor:
         assert exists(references), f'TrackingTerm {self.name!r} requires `references`'
         pred, target = select_pair(states, references, self.key, self.ref_key)
+        raw_mask = select_optional(references, self.mask_key)
+        mask = align_time(pred, raw_mask) if exists(raw_mask) else None
+        active = None
 
         if callable(self.metric):
             error = self.metric(pred, target)
         elif self.metric in ('rotation', 'so3'):
             error = rotation_squared_error(pred, target)
+        elif exists(mask) and not self.reduce_items:
+            error, active = masked_weighted_reduce(METRICS[self.metric](pred, target), mask, self.dim_weights, 'sum')
         else:
             error = weighted_reduce(METRICS[self.metric](pred, target), self.dim_weights, 'sum')
 
         if self.reduce_items:
-            error = weighted_reduce(error, self.item_weights, 'mean')
+            if exists(mask):
+                error, active = masked_weighted_reduce(error, mask, self.item_weights, 'mean')
+            else:
+                error = weighted_reduce(error, self.item_weights, 'mean')
+        elif exists(mask) and not exists(active):
+            m = rearrange(mask, '... 1 -> ...') if is_shape(mask, '... 1') else mask
+            active = (m.to(error) > 0).to(error)
 
         shaped = self.kernel(error) if callable(self.kernel) else KERNELS[self.kernel](error / self.denom)
-        return self.weight * shaped
+        if exists(active):
+            shaped = shaped * active
+
+        out = self.weight * shaped
+        if return_active:
+            return out, default(active, torch.ones_like(out))
+        return out
 
 class StateTerm(Module):
     def __init__(self, fn: Callable, *, weight = 1., name = None):
@@ -327,7 +375,8 @@ class AnalyticalReward(Module):
         *,
         state_transform = None,
         ref_transform = None,
-        dt = 1.
+        dt = 1.,
+        normalize_masked = False
     ):
         super().__init__()
         self.named_terms = resolve_named_terms(terms)
@@ -336,6 +385,7 @@ class AnalyticalReward(Module):
         self.state_transforms = compact(*cast_tuple(state_transform))
         self.ref_transforms = compact(*cast_tuple(ref_transform))
         self.dt = float(dt)
+        self.normalize_masked = bool(normalize_masked)
 
         children = [*(fn for _, fn in self.named_terms), *self.state_transforms, *self.ref_transforms]
         self._submodules = ModuleList(dict.fromkeys(m for m in children if isinstance(m, Module)))
@@ -354,11 +404,28 @@ class AnalyticalReward(Module):
             references = apply_transforms(references, self.ref_transforms)
 
         breakdown = {}
+        tracked_names = []
+        active_weight = None
+        total_pos_weight = 0.
 
         for name, term in self.named_terms:
-            val = term(states, references, **kwargs)
+            is_masked_track = self.normalize_masked and isinstance(term, TrackingTerm) and term.weight > 0.
+            if is_masked_track:
+                val, active = term(states, references, return_active = True, **kwargs)
+                tracked_names.append(name)
+                total_pos_weight += term.weight
+                term_w = active * term.weight
+                active_weight = term_w if not exists(active_weight) else (active_weight + term_w)
+            else:
+                val = term(states, references, **kwargs)
+
             if exists(val):
                 breakdown[name] = val * self.dt
+
+        if self.normalize_masked and exists(active_weight) and total_pos_weight > 0.:
+            scale = torch.where(active_weight > 0., total_pos_weight / active_weight.clamp(min = 1e-8), 0.)
+            for name in tracked_names:
+                breakdown[name] = breakdown[name] * scale
 
         vals = list(breakdown.values())
         assert len(vals) > 0, 'no reward terms produced a value'

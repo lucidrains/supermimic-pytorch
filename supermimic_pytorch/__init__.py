@@ -41,7 +41,9 @@ from supermimic_pytorch.latent_world_model import (
 
 from supermimic_pytorch.latent_actor import (
     LatentMotionActor,
-    latent_uniformity_loss
+    LatentPolicy,
+    latent_uniformity_loss,
+    load_policy
 )
 
 from supermimic_pytorch.adversarial import (

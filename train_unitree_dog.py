@@ -936,9 +936,180 @@ def run_ablations(out_path: Path, seed = 42, num_iterations = 48):
         foot_ylim = 160.
     )
 
-def main(out_dir = './results_unitree_dog', seed = 42, num_iterations: int | None = None, ablate = False, **kwargs):
+def save_heterogeneous_go2_mocap(
+    robot_xml: Path,
+    train_clips: list[dict],
+    eval_clip: dict,
+    out_dir: Path
+) -> tuple[Path, dict[str, Path]]:
+    from supermimic_pytorch.mujoco_mocap import build_robot, to_heading_state
+
+    rob = build_robot(robot_xml, control = 'pd')
+    front_j = np.array([n for n in rob.joint_names if n.startswith(('FL_', 'FR_'))])
+    rear_j = np.array([n for n in rob.joint_names if n.startswith(('RL_', 'RR_'))])
+    front_idx = [rob.joint_names.index(n) for n in front_j]
+    rear_idx = [rob.joint_names.index(n) for n in rear_j]
+    body_names = np.array(rob.tracked_bodies)
+
+    def fk_bodies(clip: dict) -> np.ndarray:
+        q = as_tensor(clip['qpos'], dtype = torch.float32)
+        v = as_tensor(clip['qvel'], dtype = torch.float32)
+        st = to_heading_state(q, v)
+        fk_q = torch.cat((torch.zeros((len(st), 2)), st[:, :5 + rob.nj]), dim = -1)
+        with torch.no_grad():
+            return rob.fk(qpos = fk_q)['body_pos'].float().numpy()
+
+    train_dir = out_dir / 'train_hetero'
+    eval_dir = out_dir / 'eval_views'
+    train_dir.mkdir(parents = True, exist_ok = True)
+    eval_dir.mkdir(parents = True, exist_ok = True)
+
+    # artificially split the 5 real dog clips across 5 distinct observation schemas (only 1 of 5 is full-body)
+
+    np.savez(train_dir / 'dog_0_full.npz', qpos = train_clips[0]['qpos'])
+    np.savez(train_dir / 'dog_1_front_legs.npz', joint_pos = train_clips[1]['qpos'][:, 7:][:, front_idx], joint_names = front_j)
+    np.savez(train_dir / 'dog_2_rear_legs.npz', joint_pos = train_clips[2]['qpos'][:, 7:][:, rear_idx], joint_names = rear_j)
+    np.savez(train_dir / 'dog_3_keypoints.npz', body_pos = fk_bodies(train_clips[3]), body_names = body_names)
+    np.savez(train_dir / 'dog_4_no_feet.npz', qpos = train_clips[4]['qpos'], body_mask = np.zeros(rob.nb, dtype = np.float32))
+
+    # 4 held-out test views of unseen dog_walk02
+
+    eval_paths = dict(
+        full = eval_dir / 'eval_full.npz',
+        front_legs = eval_dir / 'eval_front_legs.npz',
+        rear_legs = eval_dir / 'eval_rear_legs.npz',
+        keypoints = eval_dir / 'eval_keypoints.npz',
+    )
+    np.savez(eval_paths['full'], qpos = eval_clip['qpos'])
+    np.savez(eval_paths['front_legs'], joint_pos = eval_clip['qpos'][:, 7:][:, front_idx], joint_names = front_j)
+    np.savez(eval_paths['rear_legs'], joint_pos = eval_clip['qpos'][:, 7:][:, rear_idx], joint_names = rear_j)
+    np.savez(eval_paths['keypoints'], body_pos = fk_bodies(eval_clip), body_names = body_names)
+
+    return train_dir, eval_paths
+
+def run_heterogeneous_mocap(
+    out_path: Path,
+    seed = 42,
+    num_iterations = 40,
+    dim_latent = 8,
+    mask_dropout = 0.25,
+    policy_mask = False,
+    policy_mask_dropout = 0.5,
+    eval_every = 10,
+    save_video = True,
+    cache_root: str | None = None
+):
+    from supermimic_pytorch.cli import inspect as cli_inspect, train as cli_train
+    from supermimic_pytorch.latent_actor import load_policy
+    from supermimic_pytorch.mujoco_mocap import (
+        MotionBank, build_robot, clip_tracking_metrics, load_mocap_clips,
+        render_qpos_video, rollout_policy
+    )
+
+    out_path.mkdir(parents = True, exist_ok = True)
+    shared = Path(default(cache_root, str(out_path)))
+
+    model = build_go2_model(shared / 'cache')
+    train_clips, eval_clip = load_or_retarget_clips(model, shared / 'cache', shared / 'go2_dog_mocap.npz')
+    robot_xml = shared / 'cache' / 'unitree_go2' / 'scene.xml'
+
+    train_dir, eval_paths = save_heterogeneous_go2_mocap(robot_xml, train_clips, eval_clip, out_path / 'hetero_mocap')
+    cli_inspect(robot = str(robot_xml), mocap = str(train_dir), control = 'pd')
+
+    ckpt_path = out_path / 'hetero_policy.pt'
+    train_res = cli_train(
+        robot = str(robot_xml),
+        mocap = str(train_dir),
+        out = str(ckpt_path),
+        control = 'pd',
+        dim_latent = dim_latent,
+        mask_dropout = mask_dropout,
+        policy_mask = policy_mask,
+        policy_mask_dropout = policy_mask_dropout,
+        iterations = num_iterations,
+        eval_every = eval_every,
+        seed = seed
+    )
+
+    # evaluate trained masked-reference policy on all 4 held-out views of unseen dog_walk02
+
+    device = select_device()
+    policy = load_policy(ckpt_path, map_location = device).to(device)
+    meta = policy.metadata
+
+    rob = build_robot(robot_xml, **meta.get('robot_cfg', {}))
+    if exists(meta.get('ctrl_low')):
+        rob.ctrl_low = as_tensor(meta['ctrl_low'], dtype = torch.float32)
+        rob.ctrl_high = as_tensor(meta['ctrl_high'], dtype = torch.float32)
+
+    bank = MotionBank.from_metadata(meta, rob)
+    if exists(meta.get('nominal_qpos')):
+        bank.nominal_qpos = as_tensor(meta['nominal_qpos'], dtype = torch.float32)
+
+    med_z = float(bank.nominal_qpos[2]) if exists(bank.nominal_qpos) else 0.30
+    fall_cfg = dict(min_height = 0.45 * max(med_z, 0.1), max_tilt = 0.55)
+    full_gt = load_mocap_clips(str(eval_paths['full']), rob, target_fps = rob.fps)[0]
+
+    def eval_views(use_pmask: bool) -> dict[str, dict]:
+        out_metrics = {}
+        tag = 'masked' if (policy.dim_mask > 0 and use_pmask) else 'mask_free'
+        print(f'\n[hetero eval ({tag}) on held-out dog_walk02]', flush = True)
+        for name, path in eval_paths.items():
+            q_clip = load_mocap_clips(str(path), rob, target_fps = rob.fps)[0]
+            horizon = len(q_clip['qpos']) - 1
+            states_run, qposes, survived = rollout_policy(
+                rob, policy, device, horizon, ref_clip = q_clip, bank = bank,
+                fall_cfg = fall_cfg, use_policy_mask = use_pmask
+            )
+            obs_q, obs_ee = clip_tracking_metrics(states_run, q_clip, rob, device)
+            full_q, full_ee = clip_tracking_metrics(states_run, full_gt, rob, device)
+            surv = float(survived / max(1, horizon))
+            out_metrics[name] = dict(
+                steps = len(states_run), horizon = horizon, surv = surv,
+                obs_q_rmse = obs_q, obs_ee_mm = obs_ee, full_q_rmse = full_q, full_ee_mm = full_ee
+            )
+            obs_parts = []
+            if exists(obs_q):
+                obs_parts.append(f'obs_q {obs_q:.3f}rad')
+            if exists(obs_ee):
+                obs_parts.append(f'obs_ee {obs_ee:.1f}mm')
+            print(
+                f'  {name:11s} | surv {surv * 100:5.1f}% ({survived:3d}/{horizon}) | '
+                f'{", ".join(obs_parts):24s} | vs full GT: q {full_q:.3f}rad, ee {full_ee:.1f}mm',
+                flush = True
+            )
+            if save_video and use_pmask and name in ('full', 'front_legs', 'keypoints'):
+                render_qpos_video(rob.model, qposes, out_path / f'hetero_eval_{name}.webp', rob.fps, True, size = 480)
+        return out_metrics
+
+    eval_res = dict(default = eval_views(use_pmask = True))
+    if policy.dim_mask > 0:
+        eval_res['mask_free'] = eval_views(use_pmask = False)
+
+    summary = dict(
+        checkpoint = str(ckpt_path),
+        config = dict(
+            num_iterations = num_iterations, dim_latent = dim_latent, mask_dropout = mask_dropout,
+            policy_mask = policy_mask, policy_mask_dropout = policy_mask_dropout, seed = seed
+        ),
+        train_history = train_res['history'],
+        eval_heldout = eval_res
+    )
+    (out_path / 'heterogeneous_results.json').write_text(json.dumps(summary, indent = 2))
+    return summary
+
+def main(
+    out_dir = './results_unitree_dog',
+    seed = 42,
+    num_iterations: int | None = None,
+    ablate = False,
+    heterogeneous = False,
+    **kwargs
+):
     if ablate:
         return run_ablations(Path(out_dir), seed = seed, num_iterations = default(num_iterations, 48))
+    if heterogeneous:
+        return run_heterogeneous_mocap(Path(out_dir), seed = seed, num_iterations = default(num_iterations, 40), **kwargs)
     train(out_dir = out_dir, seed = seed, num_iterations = default(num_iterations, 64), **kwargs)
 
 if __name__ == '__main__':

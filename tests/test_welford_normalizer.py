@@ -358,7 +358,6 @@ def test_world_model_state_normalizer(dict_state):
     loss.backward()
     assert has_nonzero_grads(wm)
 
-
 def test_latent_world_model_state_normalizer():
     torch.manual_seed(8)
 
@@ -719,4 +718,38 @@ def test_low_variance_min_std_and_dead_features():
     assert losses.state.item() < 20.
     loss.backward()
     assert has_nonzero_grads(wm)
+
+def test_welford_max_count_and_stats():
+    torch.manual_seed(0)
+
+    # exact welford below max_count
+    capped = WelfordNormalizer(3, max_count = 1000, min_std = None, eps = 1e-8)
+    exact = WelfordNormalizer(3, min_std = None, eps = 1e-8)
+    x0 = torch.randn(200, 3) * 2.0 + 1.0
+    capped.update(x0)
+    exact.update(x0)
+    torch.testing.assert_close(capped.mean, exact.mean)
+    torch.testing.assert_close(capped.std, exact.std)
+    assert capped.count.item() == 200.0
+
+    # once count hits max_count, count stays capped and normalizer adapts smoothly to regime shift
+    for _ in range(40):
+        capped.update(torch.zeros(256, 3))
+    assert capped.count.item() == 1000.0
+
+    for _ in range(30):
+        capped.update(torch.randn(256, 3) * 3.0 + 5.0)
+    assert capped.count.item() == 1000.0
+    assert (capped.mean - 5.0).abs().max().item() < 0.35
+    assert (capped.std - 3.0).abs().max().item() < 0.35
+
+    # stats() returns (0, 1) on excluded dims and live (mean, std) on included dims
+    sub = WelfordNormalizer(4, subset = slice(2, None), min_std = 0.5, max_count = 500)
+    sub.update(torch.randn(64, 4) * 4.0 + 2.0)
+    m, s = sub.stats()
+    torch.testing.assert_close(m[:2], torch.zeros(2))
+    torch.testing.assert_close(s[:2], torch.ones(2))
+    assert (m[2:] - 2.0).abs().max().item() < 1.0
+    assert (s[2:] >= 0.5).all()
+
 
