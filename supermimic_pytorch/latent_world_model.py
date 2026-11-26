@@ -5,6 +5,7 @@ import torch
 from torch import Tensor
 from torch.nn import Module, Linear, GELU
 import torch.nn.functional as F
+from torch.utils._pytree import tree_map
 
 from einops import rearrange, reduce
 from ema_pytorch import EMA
@@ -20,13 +21,16 @@ from supermimic_pytorch.supermimic import (
     default,
     flatten_state,
     flatten_state_with_inverse,
+    prepend_state,
     reduce_explorative_loss,
     repeat_batch,
     resolve_action_dim,
     resolve_explorative_latent,
+    resolve_normalizer,
     sample_explorative_latent,
     to_one_hot
 )
+from supermimic_pytorch.welford_normalizer import WelfordNormalizer
 
 # helpers
 
@@ -77,7 +81,8 @@ class LatentWorldModel(Module):
         num_explorative_rollouts: int | None = None,
         dim_explorative_latent: int = 0,
         explorative_latent_scale: float = 0.25,
-        antithetic_explorative_latent: bool = True
+        antithetic_explorative_latent: bool = True,
+        state_normalizer: WelfordNormalizer | bool | None = None
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
@@ -95,6 +100,8 @@ class LatentWorldModel(Module):
         dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
         self.dim_action = dim_action
         self.has_discrete_actions = len(self.num_discrete_actions) > 0
+
+        self.state_normalizer = resolve_normalizer(state_normalizer)
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
@@ -179,13 +186,18 @@ class LatentWorldModel(Module):
         return self
 
     def encode(self, state: State):
+        if exists(self.state_normalizer):
+            state = self.state_normalizer.normalize(state)
         return self.state_encoder(flatten_state(state))
 
     def decode(self, latent):
-        return self.state_decoder(latent)
+        decoded = self.state_decoder(latent)
+        return self.state_normalizer.denormalize(decoded) if exists(self.state_normalizer) else decoded
 
     @torch.no_grad()
     def encode_target(self, state: State):
+        if exists(self.state_normalizer):
+            state = self.state_normalizer.normalize(state)
         return self.target_state_encoder(flatten_state(state))
 
     @torch.no_grad()
@@ -205,13 +217,20 @@ class LatentWorldModel(Module):
         next_rewards: Tensor | None = None,      # (b time ...)
         *,
         num_explorative_rollouts: int | None = None,
-        explorative_latent_scale: float | None = None
+        explorative_latent_scale: float | None = None,
+        update_normalizer: bool | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
         assert k >= 1
 
         orig_batch = batch_size_of(state)
+
+        if exists(self.state_normalizer):
+            if default(update_normalizer, self.training):
+                self.state_normalizer.update(prepend_state(state, next_states))
+            else:
+                self.state_normalizer.init_stats(state)
 
         state, actions, next_states, sim_context, next_terminals, next_rewards = repeat_batch(
             (state, actions, next_states, sim_context, next_terminals, next_rewards),
@@ -264,7 +283,8 @@ class LatentWorldModel(Module):
                 next_terminal,
                 next_reward,
                 explorative_latent = explorative_latent,
-                reduce_loss = False
+                reduce_loss = False,
+                update_normalizer = False
             )
 
             total_loss = total_loss + loss
@@ -287,7 +307,8 @@ class LatentWorldModel(Module):
         inverse_state = None,
         *,
         explorative_latent: Tensor | None = None,
-        reduce_loss: bool = True
+        reduce_loss: bool = True,
+        update_normalizer: bool | None = None
     ):
         if self.has_discrete_actions and not action.is_floating_point():
             action = to_one_hot(action, self.num_discrete_actions, latent.dtype)
@@ -304,9 +325,18 @@ class LatentWorldModel(Module):
         if self.pred_residual_latent:
             pred_latent = pred_latent + latent
 
+        inverse_next_state = None
+
+        if exists(next_state):
+            next_state_flat, inverse_next_state = flatten_state_with_inverse(next_state, match = inverse_state)
+            if exists(self.state_normalizer) and default(update_normalizer, self.training):
+                self.state_normalizer.update(next_state)
+            next_state = next_state_flat
+
         # decode predicted next latent back to state space
 
-        pred_next_state = self.decode(pred_latent)
+        pred_norm_next_state = self.state_decoder(pred_latent)
+        pred_next_state = self.state_normalizer.denormalize(pred_norm_next_state) if exists(self.state_normalizer) else pred_norm_next_state
 
         # maybe rewards
 
@@ -322,13 +352,6 @@ class LatentWorldModel(Module):
         if exists(self.to_terminal_pred):
             pred_terminal_logit = rearrange(self.to_terminal_pred(embed), '... 1 -> ...')
             pred_terminal = pred_terminal_logit.sigmoid()
-
-        # maybe flatten next_state
-
-        inverse_next_state = None
-
-        if exists(next_state):
-            next_state, inverse_next_state = flatten_state_with_inverse(next_state, match = inverse_state)
 
         reconstitute = inverse_state or inverse_next_state or identity
 
@@ -347,7 +370,8 @@ class LatentWorldModel(Module):
         state_loss = latent_loss = recon_loss = terminal_loss = reward_loss = None
 
         if exists(next_state):
-            state_loss = reduce(F.mse_loss(next_state, pred_next_state, reduction = 'none'), 'b d -> b', 'mean')
+            target_norm_next_state = self.state_normalizer.normalize(next_state) if exists(self.state_normalizer) else next_state
+            state_loss = reduce(F.mse_loss(target_norm_next_state, pred_norm_next_state, reduction = 'none'), 'b d -> b', 'mean')
 
             target_latent = self.encode_target(next_state)
             latent_loss = reduce(F.smooth_l1_loss(pred_latent, target_latent, reduction = 'none'), 'b d -> b', 'mean')
@@ -357,7 +381,7 @@ class LatentWorldModel(Module):
             # e2e recon, keeps the unfrozen autoencoder honest
 
             if self.has_recon_loss:
-                recon_loss = reduce(F.mse_loss(next_state, self.decode(self.encode(next_state)), reduction = 'none'), 'b d -> b', 'mean')
+                recon_loss = reduce(F.mse_loss(target_norm_next_state, self.state_decoder(self.state_encoder(target_norm_next_state)), reduction = 'none'), 'b d -> b', 'mean')
                 total_loss = total_loss + recon_loss * self.recon_loss_weight
 
         if exists(next_reward):
@@ -388,10 +412,19 @@ class LatentWorldModel(Module):
         next_reward: Tensor | None = None,
         *,
         explorative_latent: Tensor | None = None,
-        reduce_loss: bool = True
+        reduce_loss: bool = True,
+        update_normalizer: bool | None = None
     ):
-        state, inverse_state = flatten_state_with_inverse(state)
-        latent = self.encode(state)
+        flat_state, inverse_state = flatten_state_with_inverse(state)
+
+        if exists(self.state_normalizer):
+            if default(update_normalizer, self.training and exists(next_state)):
+                real_states = tree_map(lambda a, b: torch.stack((a, b), dim = 1), state, next_state) if exists(next_state) else state
+                self.state_normalizer.update(real_states)
+            else:
+                self.state_normalizer.init_stats(state)
+
+        latent = self.encode(flat_state)
 
         return self.forward_from_latent(
             latent,
@@ -402,5 +435,6 @@ class LatentWorldModel(Module):
             next_reward,
             inverse_state = inverse_state,
             explorative_latent = explorative_latent,
-            reduce_loss = reduce_loss
+            reduce_loss = reduce_loss,
+            update_normalizer = False
         )

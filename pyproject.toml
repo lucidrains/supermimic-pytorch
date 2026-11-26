@@ -1,6 +1,6 @@
 [project]
 name = "supermimic-pytorch"
-version = "0.1.1"
+version = "0.1.2"
 description = "Unofficial implementation of Supermimic, Scaling Humanoid Whole-Body Control with One Differentiable World Model"
 authors = [
     { name = "Phil Wang", email = "lucidrains@gmail.com" }

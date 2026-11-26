@@ -26,6 +26,7 @@ from torch_einops_utils import (
     slice_left_at_dim,
     slice_right_at_dim,
     tree_flatten_with_inverse,
+    tree_map_detach,
     tree_map_tensor,
     uniform_like
 )
@@ -39,6 +40,8 @@ from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 from ema_pytorch import EMA
 from assoc_scan import AssocScan
 from discrete_continuous_embed_readout import MultiCategorical
+
+from supermimic_pytorch.welford_normalizer import WelfordNormalizer
 
 # functions
 
@@ -104,6 +107,9 @@ def flatten_state(state: State, match = None):
 
 def batch_size_of(tree) -> int:
     return size(next(t for t in tree_leaves(tree) if is_tensor(t)), '[b] ...')
+
+def prepend_state(s0: State, next_states: State) -> State:
+    return tree_map(lambda a, b: cat((rearrange(a, 'b ... -> b 1 ...'), b), dim = 1), s0, next_states)
 
 def repeat_batch(tree, k: int):
     if k <= 1:
@@ -363,6 +369,14 @@ class HistoryWindow(Module):
 def resolve_history(window: HistoryWindow | int | None, **kwargs) -> HistoryWindow | None:
     return (HistoryWindow(window, **kwargs) if window > 0 else None) if isinstance(window, int) else window
 
+def resolve_normalizer(
+    normalizer: WelfordNormalizer | bool | None,
+    data_shape: int | tuple[int, ...] | dict | None = None
+) -> WelfordNormalizer | None:
+    if isinstance(normalizer, WelfordNormalizer):
+        return normalizer
+    return WelfordNormalizer(data_shape = data_shape) if normalizer else None
+
 def action_smoothness_penalty(
     actions: State,
     past_actions: State | None = None,
@@ -508,6 +522,7 @@ class HumanoidActor(Module):
 
 class Critic(Module):
     assoc_scan = AssocScan(reverse = True)
+    structured_input = True
 
     def __init__(
         self,
@@ -517,7 +532,8 @@ class Critic(Module):
         dim_sim_context = 33,
         dim_hiddens = (256, 128),
         activation = GELU(),
-        normed_mlp = False
+        normed_mlp = False,
+        state_normalizer: WelfordNormalizer | bool | None = None
     ):
         super().__init__()
 
@@ -525,6 +541,7 @@ class Critic(Module):
 
         self.dim_in = dim_state + dim_goal + dim_sim_context
         self.net = mlp_klass(self.dim_in, *dim_hiddens, 1, activation = activation)
+        self.state_normalizer = resolve_normalizer(state_normalizer, data_shape = dim_state)
 
         last_layer = self.net.layers[-1]
         last_linear = last_layer[0] if normed_mlp else last_layer
@@ -565,8 +582,13 @@ class Critic(Module):
         goal = None,                        # (b g) or (b t g)
         sim_context = None,                 # (b c)
         returns = None,                     # (b n) -> loss
-        mask = None                         # (b n)
+        mask = None,                        # (b n)
+        *,
+        update_normalizer: bool | None = None
     ):
+        if exists(self.state_normalizer):
+            state = self.state_normalizer(state, update = default(update_normalizer, self.training and exists(returns)))
+
         state = flatten_state(state)
 
         num_steps = size(state, 'b t d -> t') if state.ndim == 3 else None
@@ -619,7 +641,8 @@ class WorldModel(Module):
         num_explorative_rollouts: int | None = None,
         dim_explorative_latent: int = 0,
         explorative_latent_scale: float = 0.25,
-        antithetic_explorative_latent: bool = True
+        antithetic_explorative_latent: bool = True,
+        state_normalizer: WelfordNormalizer | bool | None = None
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
@@ -637,6 +660,8 @@ class WorldModel(Module):
         dim_action, self.num_discrete_actions = resolve_action_dim(dim_action, num_discrete_actions)
         self.dim_action = dim_action
         self.has_discrete_actions = len(self.num_discrete_actions) > 0
+
+        self.state_normalizer = resolve_normalizer(state_normalizer, data_shape = dim_state)
 
         mlp_klass = MLP if not normed_mlp else NormedMLP
 
@@ -684,13 +709,22 @@ class WorldModel(Module):
         next_rewards: Tensor | None = None,      # (b time ...)
         *,
         num_explorative_rollouts: int | None = None,
-        explorative_latent_scale: float | None = None
+        explorative_latent_scale: float | None = None,
+        update_normalizer: bool | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
         assert k >= 1
 
         orig_batch = batch_size_of(state)
+
+        # update running stats once on real logged states [s_0, ..., s_k], never on predicted states
+
+        if exists(self.state_normalizer):
+            if default(update_normalizer, self.training):
+                self.state_normalizer.update(prepend_state(state, next_states))
+            else:
+                self.state_normalizer.init_stats(state)
 
         state, actions, next_states, sim_context, next_terminals, next_rewards = repeat_batch(
             (state, actions, next_states, sim_context, next_terminals, next_rewards),
@@ -741,7 +775,8 @@ class WorldModel(Module):
                 next_terminal,
                 next_reward,
                 explorative_latent = explorative_latent,
-                reduce_loss = False
+                reduce_loss = False,
+                update_normalizer = False
             )
 
             total_loss = total_loss + loss
@@ -763,9 +798,20 @@ class WorldModel(Module):
         next_reward: Tensor | None = None,
         *,
         explorative_latent: Tensor | None = None,
-        reduce_loss: bool = True
+        reduce_loss: bool = True,
+        update_normalizer: bool | None = None
     ):
-        state, inverse_state = flatten_state_with_inverse(state)
+        flat_state, inverse_state = flatten_state_with_inverse(state)
+        flat_next_state = flatten_state(next_state, match = inverse_state) if exists(next_state) else None
+
+        if exists(self.state_normalizer):
+            if default(update_normalizer, self.training and exists(next_state)):
+                real_states = tree_map(lambda a, b: torch.stack((a, b), dim = 1), state, next_state) if exists(next_state) else state
+                self.state_normalizer.update(real_states)
+            else:
+                self.state_normalizer.init_stats(state)
+
+        state = flat_state
 
         if self.has_discrete_actions and not action.is_floating_point():
             action = to_one_hot(action, self.num_discrete_actions, state.dtype)
@@ -777,16 +823,16 @@ class WorldModel(Module):
 
         # world model is just a forward dynamics model f(s, a, [xi, z]) -> s'
 
-        embed = self.transition_mlp(compact(state, action, sim_context, explorative_latent))
+        norm_state = self.state_normalizer.normalize(state) if exists(self.state_normalizer) else state
+
+        embed = self.transition_mlp(compact(norm_state, action, sim_context, explorative_latent))
 
         # whether predicting residual state or not
 
         pred_state = self.to_state_pred(embed)
 
-        pred_next_state = pred_state
-
-        if self.pred_residual_state:
-            pred_next_state = pred_next_state + state
+        pred_norm_next_state = pred_state + norm_state if self.pred_residual_state else pred_state
+        pred_next_state = self.state_normalizer.denormalize(pred_norm_next_state) if exists(self.state_normalizer) else pred_norm_next_state
 
         # maybe rewards
 
@@ -809,7 +855,7 @@ class WorldModel(Module):
 
         # maybe loss
 
-        need_loss = exists(next_state) or exists(next_terminal) or exists(next_reward)
+        need_loss = exists(flat_next_state) or exists(next_terminal) or exists(next_reward)
 
         if not need_loss:
             return pred
@@ -817,9 +863,9 @@ class WorldModel(Module):
         total_loss = state.new_zeros(size(state, '[b] d'))
         state_loss = reward_loss = terminal_loss = None
 
-        if exists(next_state):
-            next_state = flatten_state(next_state, match = inverse_state)
-            state_loss = reduce(F.mse_loss(next_state, pred_next_state, reduction = 'none'), 'b d -> b', 'mean')
+        if exists(flat_next_state):
+            target_norm_next_state = self.state_normalizer.normalize(flat_next_state) if exists(self.state_normalizer) else flat_next_state
+            state_loss = reduce(F.mse_loss(target_norm_next_state, pred_norm_next_state, reduction = 'none'), 'b d -> b', 'mean')
             total_loss = total_loss + state_loss * self.state_loss_weight
 
         if exists(next_reward):
@@ -861,6 +907,7 @@ class SuperMimic(Module):
         obs_history: HistoryWindow | int | None = None,
         action_history: HistoryWindow | int | None = None,
         goal_window: HistoryWindow | int | None = None,
+        obs_normalizer: WelfordNormalizer | bool | None = None,
         reward_fn: Module | Callable | None = None,
         termination_fn: Module | Callable | None = None,
         action_smoothness_weight: float = 0.,
@@ -909,6 +956,7 @@ class SuperMimic(Module):
         self.obs_history = resolve_history(obs_history)
         self.action_history = resolve_history(action_history, dim = self.dim_action, lag = 1)
         self.goal_window = resolve_history(goal_window, future = True, pad_mode = 'replicate')
+        self.obs_normalizer = resolve_normalizer(obs_normalizer)
 
         self.action_smoothness_weight = action_smoothness_weight
 
@@ -919,16 +967,27 @@ class SuperMimic(Module):
         if use_ema_critic:
             assert exists(critic), '`critic` must be passed when `use_ema_critic = True`'
 
+            ema_kwargs = dict(critic_ema_kwargs)
+            ignore_prefixes = set(ema_kwargs.pop('ignore_startswith_names', set())) | {'state_normalizer'}
+
             self.ema_critic = EMA(
                 critic,
                 include_online_model = False,
                 beta = critic_ema_decay,
                 update_after_step = 0,
                 update_every = 1,
-                **critic_ema_kwargs
+                ignore_startswith_names = ignore_prefixes,
+                **ema_kwargs
             )
 
+            critic_norm = getattr(critic, 'state_normalizer', None)
+            if isinstance(critic_norm, WelfordNormalizer):
+                self.ema_critic.ema_model.state_normalizer = critic_norm
+
             freeze(self.ema_critic.ema_model).eval()
+
+            if isinstance(critic_norm, WelfordNormalizer):
+                critic_norm.train(critic.training)
 
         # discount factor, for loss as well as gae (once critic is involved)
 
@@ -957,7 +1016,17 @@ class SuperMimic(Module):
         super().train(mode)
         if exists(self.ema_critic):
             self.ema_critic.ema_model.eval()
+            critic_norm = getattr(self.critic, 'state_normalizer', None)
+            if isinstance(critic_norm, WelfordNormalizer):
+                critic_norm.train(mode)
         return self
+
+    def extract_obs(self, state: State, sim_context: Tensor | None = None) -> State:
+        if exists(self.state_to_obs):
+            return self.state_to_obs(state, sim_context)
+        if exists(self.actor_obs_key):
+            return select_key(state, self.actor_obs_key)
+        return state
 
     @property
     def target_critic(self):
@@ -994,14 +1063,16 @@ class SuperMimic(Module):
         if exists(self.critic_state_key):
             states = select_key(states, self.critic_state_key)
 
-        states, rewards = flatten_state(states).detach(), rewards.detach()
+        structured_critic = getattr(self.critic, 'structured_input', False)
+        states = tree_map_detach(states) if structured_critic else flatten_state(states).detach()
+        rewards = rewards.detach()
         pred_terminal = pred_terminal.detach() if exists(pred_terminal) else None
 
         goals, sim_context, mask = align_batch((goals, sim_context, mask), size(rewards, '[b] t'))
 
         if exists(goals):
             goals = flatten_state(goals)
-            num_states = size(states, 'b [t] d')
+            num_states = size(next(t for t in tree_leaves(states) if is_tensor(t)), 'b [t] d')
             if goals.ndim == 3 and size(goals, 'b [t] d') > num_states:
                 goals = goals[:, :num_states]
 
@@ -1013,8 +1084,16 @@ class SuperMimic(Module):
             survival_weights = exclusive_cumprod(1. - pred_terminal, dim = -1)
             mask = mask * survival_weights if exists(mask) else survival_weights
 
+        step_states = tree_map_tensor(lambda t: t[:, :-1], states)
         step_goals = goals[:, :-1] if exists(goals) and goals.ndim == 3 else goals
-        return self.critic(states[:, :-1], step_goals, sim_context, returns = returns, mask = mask)
+
+        critic_norm = getattr(self.critic, 'state_normalizer', None)
+        shared_with_real = isinstance(critic_norm, WelfordNormalizer) and (
+            critic_norm is getattr(self.world_model, 'state_normalizer', None) or critic_norm is self.obs_normalizer
+        )
+        norm_kwarg = dict(update_normalizer = False) if shared_with_real else dict()
+
+        return self.critic(step_states, step_goals, sim_context, returns = returns, mask = mask, **norm_kwarg)
 
     def actor_loss(
         self,
@@ -1059,7 +1138,8 @@ class SuperMimic(Module):
             if exists(self.critic_state_key):
                 final_state = select_key(final_state, self.critic_state_key)
 
-            final_state = flatten_state(final_state)
+            if not getattr(self.target_critic, 'structured_input', False):
+                final_state = flatten_state(final_state)
             final_goal = flatten_state(final_goal) if exists(final_goal) else None
 
             with frozen(self.target_critic, eval = True):
@@ -1086,13 +1166,25 @@ class SuperMimic(Module):
         *,
         num_explorative_rollouts: int | None = None,
         explorative_latent_scale: float | None = None,
-        wm_explorative_latent_scale: float | None = None
+        wm_explorative_latent_scale: float | None = None,
+        update_normalizer: bool | None = None
     ):
         actor, world_model = self.actor, self.world_model
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
         assert k >= 1
 
         orig_batch = batch_size_of(initial_state)
+
+        wm_norm = getattr(world_model, 'state_normalizer', None)
+        if isinstance(wm_norm, WelfordNormalizer):
+            wm_norm.init_stats(initial_state)
+
+        if exists(self.obs_normalizer):
+            init_obs = self.extract_obs(initial_state, sim_context)
+            if default(update_normalizer, self.training):
+                self.obs_normalizer.update(init_obs)
+            else:
+                self.obs_normalizer.init_stats(init_obs)
 
         initial_state, sim_context, actor_goals, actor_cond, references, past_obs, past_actions, past_mask = repeat_batch(
             (initial_state, sim_context, actor_goals, actor_cond, references, past_obs, past_actions, past_mask),
@@ -1122,7 +1214,8 @@ class SuperMimic(Module):
 
         obs_cache = None
         if exists(self.obs_history) and exists(past_obs):
-            obs_cache = self.obs_history.push(past_obs, mask = past_mask)
+            norm_past_obs = self.obs_normalizer.normalize(past_obs) if exists(self.obs_normalizer) else past_obs
+            obs_cache = self.obs_history.push(norm_past_obs, mask = past_mask)
 
         act_cache = None
         if exists(self.action_history):
@@ -1160,14 +1253,11 @@ class SuperMimic(Module):
             latent = world_model.encode(state) if is_latent_wm else None
 
             for t in range(num_rollout_timesteps):
-                obs = inverse_state(state)
-
-                if exists(self.state_to_obs):
-                    obs = self.state_to_obs(obs, sim_context)
-                elif exists(self.actor_obs_key):
-                    obs = select_key(obs, self.actor_obs_key)
-
+                obs = self.extract_obs(inverse_state(state), sim_context)
                 obs = add_observation_noise(obs, obs_noise)
+
+                if exists(self.obs_normalizer):
+                    obs = self.obs_normalizer.normalize(obs)
 
                 if exists(self.obs_history):
                     obs, obs_cache = self.obs_history.step(obs, obs_cache)

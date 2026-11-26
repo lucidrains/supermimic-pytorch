@@ -1,3 +1,8 @@
+from supermimic_pytorch.welford_normalizer import (
+    WelfordNormalizer,
+    welford_combine
+)
+
 from supermimic_pytorch.supermimic import (
     WorldModel,
     HumanoidActor,
