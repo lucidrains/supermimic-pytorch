@@ -267,3 +267,15 @@ $ uv run train_unitree_dog.py
     url       = {https://arxiv.org/abs/2002.09405},
 }
 ```
+
+```bibtex
+@misc{luo2026handson,
+    title   = {HandsOn: A Large-Scale Simulation Benchmark for Generalizable Dexterous Manipulation},
+    author  = {Tianwei Luo and Yiming He and Hongjin Wu and Ting Pan and Debin Ren and Haorui Guo and Junlin Yang and Yuxin Zuo and Zhehao Kou and Kaisen Yang and Zhuoqun Lai and Yi Ding and Jiale Yu and Yuchen Zhang and Zijie Qiu and Haozhan Li and Ning Ding},
+    year    = {2026},
+    eprint  = {2610.26765},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2610.26765},
+}
+```

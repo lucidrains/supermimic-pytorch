@@ -29,8 +29,8 @@ from supermimic_pytorch import (
 from supermimic_pytorch.mujoco_mocap import (
     MocapCollectEnvs, MotionBank, Robot, build_motion_bank,
     build_robot as _build_robot, clip_tracking_metrics, compute_action_scaling,
-    evaluate_policy, load_mocap_clips, parse_csv, render_qpos_video,
-    require, rollout_policy, unpack_state
+    encode_clip_windows, evaluate_policy, load_mocap_clips, parse_csv,
+    render_qpos_video, require, rollout_policy, unpack_state
 )
 from supermimic_pytorch.supermimic import default, divisible_by, exists
 from supermimic_pytorch.welford_normalizer import identity
@@ -70,9 +70,10 @@ def load_callable(ref):
     assert isinstance(ref, str) and ':' in ref, f'expected callable or `file_or_module:attr`, got {ref!r}'
     mod_part, attr_name = ref.rsplit(':', 1)
     mod_path = Path(mod_part).expanduser()
+    file_path = mod_path if (mod_path.suffix == '.py' or mod_path.exists()) else mod_path.with_suffix('.py')
 
-    if mod_path.suffix == '.py' or mod_path.exists():
-        resolved = mod_path.resolve()
+    if mod_path.suffix == '.py' or file_path.exists():
+        resolved = file_path.resolve()
         assert resolved.exists(), f'hook file not found: {resolved}'
         spec = importlib.util.spec_from_file_location(f'_supermimic_hook_{resolved.stem}', resolved)
         assert exists(spec) and exists(spec.loader), f'failed to load hook file: {resolved}'
@@ -416,7 +417,7 @@ def train(
     robot: str | Any | None = None, mocap: str | None = None, out: str = './supermimic_policy.pt', *, config: str | None = None,
     # latent space & normalization
     mode: str = 'auto', dim_latent: int = 4, latent_space: str = 'box', clip_len: int | None = None, clip_stride: int | None = None,
-    enc_frames: int = 5, uniformity_weight: float = 4.0, latent_noise: float = 0.10, norm: str = 'all', norm_max_count: float | None = 100_000,
+    enc_frames: int = 5, center_pos_slices = (), uniformity_weight: float = 4.0, latent_noise: float = 0.10, norm: str = 'all', norm_max_count: float | None = 100_000,
     # masked references & optional policy mask conditioning
     mask_dropout: float = 0.0, mask_align_weight: float = 1.0, policy_mask: bool = False, policy_mask_dropout: float = 0.5, unobserved_joint_weight: float = 0.15,
     # MuJoCo robot & reward
@@ -426,7 +427,7 @@ def train(
     fall_termination_enabled: bool = True, min_height: float | None = None, max_tilt: float = 0.55, obs_noise: float = 0.0,
     joint_weight: float = 2.0, body_weight: float = 2.5, body_std: float | None = None, joint_limit_weight: float = -0.5, action_smoothness_weight: float = -0.015,
     # custom Python hooks
-    reward_fn = None, termination_fn = None, extra_state_fn = None, obs_fn = None, actor_fn = None, world_model_fn = None,
+    reward_fn = None, termination_fn = None, extra_state_fn = None, obs_fn = None, actor_fn = None, world_model_fn = None, critic_fn = None,
     # training loop & architecture
     iterations: int = 80, num_envs: int = 16, env_horizon: int = 96, warmup_steps: int = 128, warmup_wm_updates: int = 300,
     collect_steps: int = 16, buffer_capacity: int = 64_000, batch_size: int = 256, wm_horizon: int = 8, imag_horizon: int = 16,
@@ -532,9 +533,7 @@ def train(
         state_normalizer = state_norm
     )
 
-    actor = (call_factory(actor_fn, dict(**actor_kw, robot = rob, bank = bank)) if exists(actor_fn) else LatentMotionActor(**actor_kw)).to(dev)
-    world_model = (call_factory(world_model_fn, dict(**wm_kw, robot = rob, bank = bank)) if exists(world_model_fn) else WorldModel(**wm_kw)).to(dev)
-    critic = Critic(
+    critic_kw = dict(
         dim_state = dim_state,
         dim_goal = dim_latent + dim_pmask,
         dim_sim_context = 0,
@@ -542,7 +541,11 @@ def train(
         activation = SiLU(),
         normed_mlp = True,
         state_normalizer = state_norm
-    ).to(dev)
+    )
+
+    actor = (call_factory(actor_fn, dict(**actor_kw, robot = rob, bank = bank)) if exists(actor_fn) else LatentMotionActor(**actor_kw)).to(dev)
+    world_model = (call_factory(world_model_fn, dict(**wm_kw, robot = rob, bank = bank)) if exists(world_model_fn) else WorldModel(**wm_kw)).to(dev)
+    critic = (call_factory(critic_fn, dict(**critic_kw, robot = rob, bank = bank)) if exists(critic_fn) else Critic(**critic_kw)).to(dev)
     sync_models(accelerator, world_model, actor, critic)
 
     wm_opt = AdamW(world_model.parameters(), lr = wm_lr, weight_decay = 1e-5)
@@ -982,6 +985,58 @@ def eval(
 
     return result
 
+@with_config
+@torch.no_grad()
+def encode(
+    checkpoint: str | None = None, mocap: str | None = None, out: str | None = None, *, config: str | None = None,
+    robot: str | Any | None = None, stride: int | None = None, quat_order: str = 'wxyz', device: str = 'auto'
+) -> dict[str, Any]:
+    """Encode reference mocap clips into a trained LatentPolicy's latent space."""
+    assert exists(checkpoint) and exists(mocap), 'pass `--checkpoint` and `--mocap` (or set them in `--config`)'
+
+    accelerator = make_accelerator(device = device)
+    dev = accelerator.device
+
+    policy = load_policy(checkpoint, map_location = dev).to(dev)
+    meta = policy.metadata
+
+    robot_path = default(robot, meta.get('robot_path'))
+    assert exists(robot_path), 'pass `--robot` (checkpoint metadata has no robot_path)'
+    rob = build_robot(robot_path, **meta.get('robot_cfg', {}))
+    bank = MotionBank.from_metadata(meta, rob)
+    clips = load_mocap_clips(mocap, rob, quat_order = quat_order, target_fps = rob.fps)
+
+    step = max(1, int(default(stride, max(1, bank.window_len // 2))))
+    encoded: dict[str, dict[str, Any]] = {}
+
+    for clip in clips:
+        z, starts = encode_clip_windows(clip, bank, policy, dev, stride = step)
+        encoded[clip['name']] = dict(
+            latents = z.cpu(),
+            starts = starts,
+            num_frames = int(len(clip['qpos'])),
+            window_len = bank.window_len
+        )
+
+    payload = dict(
+        checkpoint = str(Path(checkpoint).expanduser().resolve()),
+        dim_latent = policy.dim_latent,
+        latent_space = policy.latent_space,
+        window_len = bank.window_len,
+        stride = step,
+        clips = encoded
+    )
+    if exists(out):
+        out_path = Path(out).expanduser()
+        out_path.parent.mkdir(parents = True, exist_ok = True)
+        torch.save(payload, out_path)
+        accelerator.print(f'[supermimic encode] encoded {len(encoded)} clip(s) -> {out_path}')
+    else:
+        total_w = sum(len(v['latents']) for v in encoded.values())
+        accelerator.print(f'[supermimic encode] encoded {len(encoded)} clip(s) ({total_w} latent windows, dim={policy.dim_latent})')
+
+    return payload
+
 def ignore_return(fn):
     @functools.wraps(fn)
     def runner(*args, **kwargs):
@@ -992,7 +1047,8 @@ def main():
     require('fire').Fire(dict(
         inspect = ignore_return(inspect),
         train = ignore_return(train),
-        eval = ignore_return(eval)
+        eval = ignore_return(eval),
+        encode = ignore_return(encode)
     ))
 
 if __name__ == '__main__':

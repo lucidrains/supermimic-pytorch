@@ -94,6 +94,30 @@ def slice_clip_window(clip: dict, start: int, length: int, *, include_bodies: bo
     bmask = pad_or_slice(clip['body_mask'][start:end], length) if has_bodies else None
     return states, bodies, jmask, rmask, bmask
 
+def clip_window_starts(num_frames: int, window_len: int, stride: int | None = None) -> list[int]:
+    step = max(1, int(default(stride, max(1, window_len // 2))))
+    starts = list(range(0, max(1, num_frames - window_len + 1), step))
+    if num_frames > window_len and starts[-1] != num_frames - window_len:
+        starts.append(num_frames - window_len)
+    return starts
+
+@torch.no_grad()
+def encode_clip_windows(
+    clip: dict,
+    bank: MotionBank,
+    policy: LatentPolicy,
+    device: torch.device,
+    *,
+    stride: int | None = None
+) -> tuple[Tensor, list[int]]:
+    starts = clip_window_starts(len(clip['states']), bank.window_len, stride)
+    feats = [
+        bank.encode(*slice_clip_window(clip, st, bank.window_len, include_bodies = bank.has_bodies))
+        for st in starts
+    ]
+    latents = policy.encode(stack(feats, dim = 0).to(device), add_noise = False)
+    return latents, starts
+
 def expand_mask(mask, num_frames: int, dim: int) -> Tensor:
     t = to_float_tensor(mask)
     if t.ndim == 0:
@@ -516,7 +540,7 @@ def resolve_mocap_files(mocap_spec) -> list[Path]:
             files.append(path)
 
     unique = list(dict.fromkeys(f.resolve() for f in files))
-    assert unique, f'no supported mocap files (.npz, .npy, .pt, .csv) found for {mocap_spec!r}'
+    assert unique, f'no supported mocap files (.npz, .npy, .pt, .csv, .parquet) found for {mocap_spec!r}'
     return unique
 
 def extract_clips(obj, stem: str, quat_order: str) -> list[dict[str, Any]]:
@@ -814,6 +838,7 @@ class MotionBank:
     body_mean: Tensor | None = None
     body_span: float = 0.0
     body_enc_scale: float = 1.0
+    center_pos_slices: tuple[tuple[int, int], ...] = ()
     use_masks: bool = False
     has_partial: bool = False
     nominal_qpos: Tensor | None = None
@@ -874,6 +899,16 @@ class MotionBank:
     ) -> Tensor:
         unbatched = states_w.ndim == 2
         s = rearrange(states_w, 't d -> 1 t d') if unbatched else states_w
+        b = (rearrange(body_w, 't k d -> 1 t k d') if unbatched else body_w) if exists(body_w) else None
+
+        if self.center_pos_slices:
+            c0 = stack([s[:, 0:1, lo:hi] for lo, hi in self.center_pos_slices], dim = 0).mean(dim = 0)
+            s = s.clone()
+            for lo, hi in self.center_pos_slices:
+                s[:, :, lo:hi] = s[:, :, lo:hi] - c0
+            if exists(b):
+                b = b - rearrange(c0, 'b 1 d -> b 1 1 d')
+
         idx = self.enc_idx.to(s.device)
         kin_norm = (s[:, idx, :self.kin_dim] - self.motion_mean.to(s)) / self.motion_std.to(s)
 
@@ -892,8 +927,7 @@ class MotionBank:
         else:
             parts = [rearrange(kin_norm, 'b t d -> b (t d)')]
 
-        if exists(body_w) and exists(self.body_mean):
-            b = rearrange(body_w, 't k d -> 1 t k d') if unbatched else body_w
+        if exists(b) and exists(self.body_mean):
             b_norm = (b[:, idx] - self.body_mean[0].to(b)) / self.body_enc_scale
 
             if self.use_masks:
@@ -937,7 +971,8 @@ class MotionBank:
             motion_mean = self.motion_mean.cpu().tolist(),
             motion_std = self.motion_std.cpu().tolist(),
             body_mean = self.body_mean.cpu().tolist() if exists(self.body_mean) else None,
-            body_enc_scale = self.body_enc_scale
+            body_enc_scale = self.body_enc_scale,
+            center_pos_slices = [list(sl) for sl in self.center_pos_slices]
         )
 
     @classmethod
@@ -946,6 +981,7 @@ class MotionBank:
         m_mean = as_tensor(meta['motion_mean'], dtype = torch.float32) if exists(meta.get('motion_mean')) else torch.zeros(kin_dim)
         m_std = as_tensor(meta['motion_std'], dtype = torch.float32) if exists(meta.get('motion_std')) else torch.ones(kin_dim)
         b_mean = as_tensor(meta['body_mean'], dtype = torch.float32) if exists(meta.get('body_mean')) else None
+        c_slices = tuple((int(sl[0]), int(sl[1])) for sl in meta.get('center_pos_slices', ()))
 
         return cls(
             mode = meta.get('mode', 'clips'),
@@ -957,6 +993,7 @@ class MotionBank:
             motion_std = m_std,
             body_mean = b_mean,
             body_enc_scale = float(meta.get('body_enc_scale', 1.0)),
+            center_pos_slices = c_slices,
             use_masks = bool(meta.get('use_masks', False))
         )
 
@@ -994,9 +1031,11 @@ def build_motion_bank(
     clip_len: int | None = None,
     clip_stride: int | None = None,
     enc_frames: int = 5,
-    mask_dropout: float = 0.0
+    mask_dropout: float = 0.0,
+    center_pos_slices: tuple[tuple[int, int], ...] = ()
 ) -> MotionBank:
     assert mode in ('auto', 'skills', 'clips'), f'unknown mode {mode!r}'
+    c_slices = tuple((int(sl[0]), int(sl[1])) for sl in center_pos_slices) if exists(center_pos_slices) else ()
     if mode == 'auto':
         med_len = float(torch.tensor([len(c['qpos']) for c in clips], dtype = torch.float32).median().item())
         mode = 'skills' if (not robot.has_free_root and len(clips) >= 2 and med_len <= 2 * imag_horizon) else 'clips'
@@ -1022,13 +1061,23 @@ def build_motion_bank(
         min_mot = as_tensor([0.05] + [0.08] * 4 + [0.15] * robot.nj + [0.30] * 3 + [0.50] * 3, dtype = torch.float32)
     else:
         min_mot = torch.full((robot.nq,), 0.15)
-    mot_mean, mot_std = masked_mean_std(all_states[:, :robot.kin_dim], all_kmask, min_mot)
+
+    stat_kin = all_states[:, :robot.kin_dim]
+    stat_c = None
+    if c_slices:
+        stat_c = stack([stat_kin[:, lo:hi] for lo, hi in c_slices], dim = 0).mean(dim = 0)
+        stat_kin = stat_kin.clone()
+        for lo, hi in c_slices:
+            stat_kin[:, lo:hi] = stat_kin[:, lo:hi] - stat_c
+
+    mot_mean, mot_std = masked_mean_std(stat_kin, all_kmask, min_mot)
 
     if has_bodies:
         all_bp = cat([c['body_pos'] for c in clips], dim = 0)
+        stat_bp = (all_bp - rearrange(stat_c, 'n d -> n 1 d')) if exists(stat_c) else all_bp
         bm_flat = all_bmask > 0.5
         if bm_flat.any():
-            valid_pts = all_bp[bm_flat]
+            valid_pts = stat_bp[bm_flat]
             body_mean = rearrange(valid_pts.mean(dim = 0), 'd -> 1 1 d')
             body_span = float((valid_pts.amax(dim = 0) - valid_pts.amin(dim = 0)).norm().item())
         else:
@@ -1051,6 +1100,7 @@ def build_motion_bank(
         body_mean = body_mean,
         body_span = body_span,
         body_enc_scale = body_enc_scale,
+        center_pos_slices = c_slices,
         use_masks = use_masks,
         has_partial = has_partial,
         nominal_qpos = compute_nominal_qpos(clips, robot)
@@ -1073,13 +1123,8 @@ def build_motion_bank(
                 prim_refs_b.append(b_w[rs : rs + imag_horizon])
                 prim_refs_bm.append(bm_w[rs : rs + imag_horizon])
     else:
-        stride = max(1, int(default(clip_stride, max(1, window_len // 2))))
         for clip in clips:
-            n = len(clip['qpos'])
-            starts = list(range(0, max(1, n - window_len + 1), stride))
-            if n > window_len and starts[-1] != n - window_len:
-                starts.append(n - window_len)
-
+            starts = clip_window_starts(len(clip['qpos']), window_len, clip_stride)
             for st in starts:
                 s_w, b_w, jm_w, rm_w, bm_w = slice_clip_window(clip, st, window_len, include_bodies = has_bodies)
                 prim_names.append(f'{clip["name"]}@{st}' if len(starts) > 1 else clip['name'])
