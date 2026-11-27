@@ -17,6 +17,7 @@ from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
 from supermimic_pytorch.supermimic import (
     State,
+    add_state_noise,
     batch_size_of,
     default,
     flatten_state,
@@ -27,6 +28,7 @@ from supermimic_pytorch.supermimic import (
     resolve_action_dim,
     resolve_explorative_latent,
     resolve_normalizer,
+    rollout_step_weights,
     sample_explorative_latent,
     to_one_hot
 )
@@ -76,6 +78,8 @@ class LatentWorldModel(Module):
         recon_loss_weight = 1.,
         reward_loss_weight = 1.,
         terminal_loss_weight = 1.,
+        rollout_loss_decay: float = 1.,
+        state_noise_scale: float = 0.,
         ema_decay = 0.999,
         freeze_autoencoder = True,
         num_explorative_rollouts: int | None = None,
@@ -86,6 +90,8 @@ class LatentWorldModel(Module):
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
+        assert 0. < rollout_loss_decay <= 1., '`rollout_loss_decay` must be in (0, 1]'
+        assert state_noise_scale >= 0., '`state_noise_scale` must be non-negative'
 
         # explorative modeling - Gladstone et al. (2026); antithetic pairing - Jia et al. (2025)
 
@@ -157,13 +163,15 @@ class LatentWorldModel(Module):
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_latent = pred_residual_latent
 
-        # losses
+        # losses (temporal decay rho^t - Hansen et al. 2024; training noise - Sanchez-Gonzalez et al. 2020)
 
         self.state_loss_weight = state_loss_weight
         self.latent_loss_weight = latent_loss_weight
         self.recon_loss_weight = recon_loss_weight
         self.reward_loss_weight = reward_loss_weight
         self.terminal_loss_weight = terminal_loss_weight
+        self.rollout_loss_decay = float(rollout_loss_decay)
+        self.state_noise_scale = float(state_noise_scale)
 
     @property
     def has_recon_loss(self):
@@ -218,11 +226,17 @@ class LatentWorldModel(Module):
         *,
         num_explorative_rollouts: int | None = None,
         explorative_latent_scale: float | None = None,
+        rollout_loss_decay: float | None = None,
+        state_noise_scale: float | None = None,
         update_normalizer: bool | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
         assert k >= 1
+
+        decay = float(default(rollout_loss_decay, self.rollout_loss_decay))
+        noise_scale = float(default(state_noise_scale, self.state_noise_scale))
+        step_weights = rollout_step_weights(num_steps, decay)
 
         orig_batch = batch_size_of(state)
 
@@ -232,13 +246,16 @@ class LatentWorldModel(Module):
             else:
                 self.state_normalizer.init_stats(state)
 
+        state, inverse_state = flatten_state_with_inverse(state)
+        next_states = flatten_state(next_states, match = inverse_state)
+
+        if self.training:
+            state = add_state_noise(state, noise_scale, self.state_normalizer)
+
         state, actions, next_states, sim_context, next_terminals, next_rewards = repeat_batch(
             (state, actions, next_states, sim_context, next_terminals, next_rewards),
             k
         )
-
-        state, inverse_state = flatten_state_with_inverse(state)
-        next_states = flatten_state(next_states, match = inverse_state)
 
         latent = self.encode(state)
 
@@ -263,7 +280,7 @@ class LatentWorldModel(Module):
 
         # latent rollout
 
-        for time_index in range(num_steps):
+        for time_index, step_weight in enumerate(step_weights):
             action = actions[:, time_index]
             next_state = next_states[:, time_index]
 
@@ -287,7 +304,7 @@ class LatentWorldModel(Module):
                 update_normalizer = False
             )
 
-            total_loss = total_loss + loss
+            total_loss = total_loss + step_weight * loss
 
             all_preds.append(pred._replace(state = inverse_state(pred.state)))
             all_losses.append(Losses(*(t.mean() if exists(t) else None for t in losses)))

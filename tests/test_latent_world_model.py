@@ -284,3 +284,53 @@ def test_explorative_latent_world_model():
     actor_loss.backward()
     assert has_grads(actor)
     assert not has_grads(world_model)
+
+def test_latent_world_model_rollout_decay_and_state_noise():
+    torch.manual_seed(0)
+
+    world_model = LatentWorldModel(
+        state_encoder = nn.Sequential(MLP(8, 16, 6), nn.Tanh()),
+        state_decoder = MLP(6, 16, 8),
+        dim_action = 2,
+        dim_sim_context = 0,
+        dim_latent = 6,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        freeze_autoencoder = False,
+        rollout_loss_decay = 0.8,
+        state_noise_scale = 0.05
+    )
+
+    state = torch.randn(4, 8)
+    actions = torch.randn(4, 5, 2)
+    next_states = torch.randn(4, 5, 8)
+    next_rewards = torch.randn(4, 5)
+    next_terminals = torch.randint(0, 2, (4, 5)).float()
+
+    # eval mode is deterministic and matches exact rho^t weighted sum
+
+    world_model.eval()
+    with torch.no_grad():
+        loss1, preds1, step_losses = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+        loss2, preds2, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+
+    assert torch.allclose(loss1, loss2)
+    assert torch.allclose(preds1[-1].state, preds2[-1].state)
+
+    weights = [0.8 ** t for t in range(5)]
+    expected_steps = [(l.state + l.latent + l.recon + l.reward + l.terminal) for l in step_losses]
+    expected_loss = sum(w * l for w, l in zip(weights, expected_steps)) * (5. / sum(weights))
+    assert torch.allclose(loss1, expected_loss, atol = 1e-5)
+
+    # train mode injects state noise and trains end-to-end
+
+    world_model.train()
+    loss_t1, preds_t1, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+    _, preds_t2, _ = world_model.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+    assert not torch.allclose(preds_t1[0].state, preds_t2[0].state)
+
+    loss_t1.backward()
+    assert has_grads(world_model.transition_mlp)
+    assert has_grads(world_model.state_encoder)
+    assert has_grads(world_model.state_decoder)

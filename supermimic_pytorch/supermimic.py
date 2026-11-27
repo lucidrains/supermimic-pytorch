@@ -442,6 +442,29 @@ def select_explorative_loss(losses: Tensor, k: int) -> Tensor:
 def reduce_explorative_loss(losses: Tensor, k: int) -> Tensor:
     return select_explorative_loss(losses, k).mean()
 
+# world model rollout helpers - temporal decay (Hansen et al. 2024) & training state noise (Sanchez-Gonzalez et al. 2020)
+
+def add_state_noise(
+    state: Tensor,
+    scale: float,
+    normalizer: WelfordNormalizer | None = None
+) -> Tensor:
+    assert scale >= 0., '`state_noise_scale` must be non-negative'
+    if scale == 0.:
+        return state
+
+    noise_std = normalizer.std.to(state) * scale if exists(normalizer) else scale
+    return state + torch.randn_like(state) * noise_std
+
+def rollout_step_weights(num_steps: int, decay: float) -> tuple[float, ...]:
+    assert 0. < decay <= 1., '`rollout_loss_decay` must be in (0, 1]'
+    if decay == 1. or num_steps == 0:
+        return (1.,) * num_steps
+
+    weights = tuple(decay ** t for t in range(num_steps))
+    scale = num_steps / sum(weights)
+    return tuple(w * scale for w in weights)
+
 # per-rollout median gradient clipping - Dang & Edelkamp (2026)
 
 def median_clip_rollout_losses(
@@ -668,6 +691,8 @@ class WorldModel(Module):
         state_loss_weight = 1.,
         reward_loss_weight = 1.,
         terminal_loss_weight = 1.,
+        rollout_loss_decay: float = 1.,
+        state_noise_scale: float = 0.,
         num_explorative_rollouts: int | None = None,
         dim_explorative_latent: int = 0,
         explorative_latent_scale: float = 0.25,
@@ -676,6 +701,8 @@ class WorldModel(Module):
     ):
         super().__init__()
         assert len(dim_hiddens) > 0
+        assert 0. < rollout_loss_decay <= 1., '`rollout_loss_decay` must be in (0, 1]'
+        assert state_noise_scale >= 0., '`state_noise_scale` must be non-negative'
 
         # explorative modeling - Gladstone et al. (2026); antithetic pairing - Jia et al. (2025)
 
@@ -723,11 +750,13 @@ class WorldModel(Module):
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_state = pred_residual_state
 
-        # losses
+        # losses (temporal decay rho^t - Hansen et al. 2024; training noise - Sanchez-Gonzalez et al. 2020)
 
         self.state_loss_weight = state_loss_weight
         self.reward_loss_weight = reward_loss_weight
         self.terminal_loss_weight = terminal_loss_weight
+        self.rollout_loss_decay = float(rollout_loss_decay)
+        self.state_noise_scale = float(state_noise_scale)
 
     def rollout(
         self,
@@ -740,11 +769,17 @@ class WorldModel(Module):
         *,
         num_explorative_rollouts: int | None = None,
         explorative_latent_scale: float | None = None,
+        rollout_loss_decay: float | None = None,
+        state_noise_scale: float | None = None,
         update_normalizer: bool | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
         assert k >= 1
+
+        decay = float(default(rollout_loss_decay, self.rollout_loss_decay))
+        noise_scale = float(default(state_noise_scale, self.state_noise_scale))
+        step_weights = rollout_step_weights(num_steps, decay)
 
         orig_batch = batch_size_of(state)
 
@@ -756,13 +791,16 @@ class WorldModel(Module):
             else:
                 self.state_normalizer.init_stats(state)
 
+        state, inverse_state = flatten_state_with_inverse(state)
+        next_states = flatten_state(next_states, match = inverse_state)
+
+        if self.training:
+            state = add_state_noise(state, noise_scale, self.state_normalizer)
+
         state, actions, next_states, sim_context, next_terminals, next_rewards = repeat_batch(
             (state, actions, next_states, sim_context, next_terminals, next_rewards),
             k
         )
-
-        state, inverse_state = flatten_state_with_inverse(state)
-        next_states = flatten_state(next_states, match = inverse_state)
 
         explorative_latent = None
 
@@ -785,7 +823,7 @@ class WorldModel(Module):
 
         # rollout across timesteps
 
-        for time_index in range(num_steps):
+        for time_index, step_weight in enumerate(step_weights):
             action = actions[:, time_index]
             next_state = next_states[:, time_index]
 
@@ -809,7 +847,7 @@ class WorldModel(Module):
                 update_normalizer = False
             )
 
-            total_loss = total_loss + loss
+            total_loss = total_loss + step_weight * loss
 
             all_preds.append(pred._replace(state = inverse_state(pred.state)))
             all_losses.append(Losses(*(t.mean() if exists(t) else None for t in losses)))

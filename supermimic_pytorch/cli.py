@@ -430,6 +430,7 @@ def train(
     # training loop & architecture
     iterations: int = 80, num_envs: int = 16, env_horizon: int = 96, warmup_steps: int = 128, warmup_wm_updates: int = 300,
     collect_steps: int = 16, buffer_capacity: int = 64_000, batch_size: int = 256, wm_horizon: int = 8, imag_horizon: int = 16,
+    wm_rollout_loss_decay: float = 1., wm_state_noise_scale: float = 0.,
     wm_updates: int = 20, policy_updates: int = 8, critic_updates: int = 4, command_every: int = 8, switch_every: int = 24,
     obs_window: int = 2, action_window: int = 1, encoder_hiddens = (128, 128), policy_hiddens = (256, 256, 256),
     wm_hiddens = (512, 512, 512), critic_hiddens = (256, 256), dim_explorative_latent: int = 4, num_explorative_rollouts: int = 2,
@@ -526,6 +527,8 @@ def train(
         activation = SiLU(),
         normed_mlp = True,
         pred_terminal = False,
+        rollout_loss_decay = wm_rollout_loss_decay,
+        state_noise_scale = wm_state_noise_scale,
         state_normalizer = state_norm
     )
 

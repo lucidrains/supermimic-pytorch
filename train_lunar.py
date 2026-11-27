@@ -51,7 +51,7 @@ from discrete_continuous_embed_readout import MultiCategorical
 from memmap_replay_buffer import StreamReplayBuffer
 from x_mlps_pytorch.normed_mlp import MLP as NormedMLP
 
-from supermimic_pytorch import WorldModel, Critic, SuperMimic, HistoryWindow
+from supermimic_pytorch import WorldModel, LatentWorldModel, Critic, SuperMimic, HistoryWindow
 from supermimic_pytorch.supermimic import repeat_batch
 
 # helpers
@@ -346,6 +346,13 @@ def main(
     use_median_grad_clip: bool | None = None,
     median_grad_clip_mult = 10.,
     state_loss_weight = 150.,
+    wm_rollout_loss_decay = 0.8,
+    wm_state_noise_scale = 0.005,
+    use_latent_wm = False,
+    dim_latent = 32,
+    latent_ema_decay = 0.99,
+    latent_loss_weight = 10.,
+    recon_loss_weight = 150.,
     discount_factor = 0.993,
     entropy_weight = 2e-3,
     num_explorative_rollouts = 2,
@@ -380,7 +387,8 @@ def main(
     is_discrete = isinstance(envs[0].action_space, gym.spaces.Discrete)
     dim_state = int(envs[0].observation_space.shape[0])
 
-    out_dir = default(out_dir, './results_lunar_discrete' if is_discrete else './results_lunar')
+    default_dir = './results_lunar_latent' if use_latent_wm else ('./results_lunar_discrete' if is_discrete else './results_lunar')
+    out_dir = default(out_dir, default_dir)
     out_path = Path(out_dir)
     out_path.mkdir(parents = True, exist_ok = True)
 
@@ -407,23 +415,42 @@ def main(
 
     ema_actor = EMA(actor, beta = ema_decay, include_online_model = False, update_after_step = 0, update_every = 1).to(device)
 
-    world_model = WorldModel(
-        dim_state = dim_state,
+    wm_kwargs = dict(
         dim_action = dim_action,
         num_discrete_actions = num_actions,
         dim_sim_context = 0,
         dim_hiddens = (256, 256, 256),
         activation = SiLU(),
         normed_mlp = True,
-        pred_residual_state = True,
         pred_terminal = True,
         pred_reward = True,
         state_loss_weight = state_loss_weight,
+        rollout_loss_decay = wm_rollout_loss_decay,
+        state_noise_scale = wm_state_noise_scale,
         num_explorative_rollouts = wm_k,
         dim_explorative_latent = active_wm_latent_dim,
         explorative_latent_scale = wm_explorative_latent_scale,
         antithetic_explorative_latent = wm_antithetic_explorative_latent
-    ).to(device)
+    )
+
+    if use_latent_wm:
+        world_model = LatentWorldModel(
+            state_encoder = NormedMLP(dim_state, 128, 128, dim_latent, activation = SiLU(), final_norm = True),
+            state_decoder = NormedMLP(dim_latent, 128, 128, dim_state, activation = SiLU()),
+            dim_latent = dim_latent,
+            pred_residual_latent = True,
+            latent_loss_weight = latent_loss_weight,
+            recon_loss_weight = recon_loss_weight,
+            ema_decay = latent_ema_decay,
+            freeze_autoencoder = False,
+            **wm_kwargs
+        ).to(device)
+    else:
+        world_model = WorldModel(
+            dim_state = dim_state,
+            pred_residual_state = True,
+            **wm_kwargs
+        ).to(device)
 
     critic = Critic(
         dim_state = dim_state,
@@ -589,6 +616,9 @@ def main(
             clip_grad_norm_(world_model.parameters(), max_grad_norm)
             world_model_opt.step()
 
+            if hasattr(world_model, 'update_ema'):
+                world_model.update_ema()
+
         return reward_scale
 
     # warmup and initial world model fit
@@ -726,8 +756,12 @@ def main(
             if eval_mean >= best_eval:
                 best_eval = eval_mean
                 torch.save(ema_actor.ema_model.state_dict(), out_path / 'actor.pt')
+                torch.save(dict(world_model = world_model.state_dict(), reward_scale = float(reward_scale.item())), out_path / 'world_model.pt')
 
             suffix = format_tags(
+                (use_latent_wm, f'latent={dim_latent}'),
+                (wm_rollout_loss_decay < 1., f'rho={wm_rollout_loss_decay:g}'),
+                (wm_state_noise_scale > 0., f'noise={wm_state_noise_scale:g}'),
                 (prefix_len > 0, f'obs={obs_window}, act={action_window}, {history_pad_mode}'),
                 (action_smoothness_weight > 0, f'smooth={action_smoothness_weight}'),
                 (imagination_horizon != 24, f'H={imagination_horizon}'),

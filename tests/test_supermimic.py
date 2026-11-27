@@ -1001,3 +1001,73 @@ def test_median_grad_clip():
     r_exp = sm_exp(state, num_rollout_timesteps = 4)
     sm_exp.actor_loss(r_exp.rewards, r_exp.terminals).backward()
     assert has_nonzero_grads(exp_actor) and not has_grads(wm)
+
+# 10. rollout loss temporal decay (Hansen et al. 2024) & input state noise (Sanchez-Gonzalez et al. 2020)
+
+def test_world_model_rollout_decay_and_state_noise():
+    torch.manual_seed(0)
+
+    wm = WorldModel(
+        dim_state = 6,
+        dim_action = 2,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        rollout_loss_decay = 0.8,
+        state_noise_scale = 0.05
+    )
+    with torch.no_grad():
+        wm.to_state_pred.weight.normal_(0., 0.1)
+
+    state = torch.randn(4, 6)
+    actions = torch.randn(4, 5, 2)
+    next_states = torch.randn(4, 5, 6)
+    next_rewards = torch.randn(4, 5)
+    next_terminals = torch.randint(0, 2, (4, 5)).float()
+
+    # eval mode disables training noise and matches exact rho^t weighted normalized average
+
+    wm.eval()
+    with torch.no_grad():
+        loss_decayed, preds_eval1, step_losses = wm.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+        loss_eval2, preds_eval2, _ = wm.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+
+    assert torch.allclose(loss_decayed, loss_eval2)
+    assert torch.allclose(preds_eval1[-1].state, preds_eval2[-1].state)
+
+    weights = [0.8 ** t for t in range(5)]
+    expected_steps = [
+        (l.state + l.reward + l.terminal) for l in step_losses
+    ]
+    expected_loss = sum(w * l for w, l in zip(weights, expected_steps)) * (5. / sum(weights))
+    assert torch.allclose(loss_decayed, expected_loss, atol = 1e-5)
+
+    # train mode perturbs initial state and backpropagates cleanly
+
+    wm.train()
+    loss_train1, preds_train1, _ = wm.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+    loss_train2, preds_train2, _ = wm.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards)
+    assert not torch.allclose(preds_train1[0].state, preds_train2[0].state)
+
+    loss_train1.backward()
+    assert has_nonzero_grads(wm)
+
+    # explorative rollouts (k > 1) share the same perturbed s0 when explorative_latent_scale = 0
+
+    wm_exp = WorldModel(
+        dim_state = 6,
+        dim_action = 2,
+        dim_sim_context = 0,
+        dim_hiddens = (16,),
+        pred_reward = True,
+        pred_terminal = True,
+        rollout_loss_decay = 0.8,
+        state_noise_scale = 0.05,
+        dim_explorative_latent = 4,
+        num_explorative_rollouts = 2,
+        state_normalizer = True
+    )
+    _, preds_exp, _ = wm_exp.rollout(state, actions, next_states, next_terminals = next_terminals, next_rewards = next_rewards, explorative_latent_scale = 0.)
+    s_bk = rearrange(preds_exp[0].state, '(b k) d -> b k d', k = 2)
+    assert torch.allclose(s_bk[:, 0], s_bk[:, 1])

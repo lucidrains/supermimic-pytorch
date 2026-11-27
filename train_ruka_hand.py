@@ -613,6 +613,8 @@ def train(
     # optimization & RL
     batch_size = 256,
     wm_horizon = 8,
+    wm_rollout_loss_decay = 0.8,
+    wm_state_noise_scale = 0.005,
     imag_horizon = 16,
     wm_updates = 20,
     policy_updates = 6,
@@ -690,7 +692,9 @@ def train(
 
     world_model = WorldModel(
         dim_state = dim_state, dim_action = nq, dim_sim_context = 0,
-        dim_hiddens = wm_dim_hiddens, activation = SiLU(), normed_mlp = True, pred_terminal = False
+        dim_hiddens = wm_dim_hiddens, activation = SiLU(), normed_mlp = True, pred_terminal = False,
+        rollout_loss_decay = wm_rollout_loss_decay,
+        state_noise_scale = wm_state_noise_scale
     ).to(device)
 
     critic = Critic(

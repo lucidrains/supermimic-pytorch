@@ -241,3 +241,29 @@ $ uv run train_unitree_dog.py
     url     = {https://arxiv.org/abs/2611.27648},
 }
 ```
+
+```bibtex
+@inproceedings{hansen2024tdmpc2,
+    title     = {TD-MPC2: Scalable, Robust World Models for Continuous Control},
+    author    = {Nicklas Hansen and Hao Su and Xiaolong Wang},
+    booktitle = {International Conference on Learning Representations (ICLR)},
+    year      = {2024},
+    eprint    = {2310.16828},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url       = {https://arxiv.org/abs/2310.16828},
+}
+```
+
+```bibtex
+@inproceedings{sanchezgonzalez2020learning,
+    title     = {Learning to Simulate Complex Physics with Graph Networks},
+    author    = {Alvaro Sanchez-Gonzalez and Jonathan Godwin and Tobias Pfaff and Rex Ying and Jure Leskovec and Peter Battaglia},
+    booktitle = {International Conference on Machine Learning (ICML)},
+    year      = {2020},
+    eprint    = {2002.09405},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url       = {https://arxiv.org/abs/2002.09405},
+}
+```
