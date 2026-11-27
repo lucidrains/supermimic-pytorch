@@ -4,7 +4,7 @@ from collections import namedtuple
 from typing import Callable, Literal
 
 import torch
-from torch import Tensor, as_tensor, cat, is_tensor
+from torch import Tensor, as_tensor, autograd, cat, is_tensor
 from torch.nn import Module, Parameter, Linear, Sequential, Tanh, GELU, Identity
 import torch.nn.functional as F
 from torch.utils._pytree import tree_map, tree_leaves
@@ -433,11 +433,41 @@ def resolve_explorative_latent(ref: Tensor, explorative_latent: Tensor | None, d
 
     return ref.new_zeros((batch, dim_latent))
 
-def reduce_explorative_loss(losses: Tensor, k: int) -> Tensor:
+def select_explorative_loss(losses: Tensor, k: int) -> Tensor:
     if k > 1:
         assert divisible_by(size(losses, '[b]'), k), f'batch {size(losses, "[b]")} must be divisible by num_explorative_rollouts {k}'
         losses = reduce(losses, '(b k) -> b', 'min', k = k)
-    return losses.mean()
+    return losses
+
+def reduce_explorative_loss(losses: Tensor, k: int) -> Tensor:
+    return select_explorative_loss(losses, k).mean()
+
+# per-rollout median gradient clipping - Dang & Edelkamp (2026)
+
+def median_clip_rollout_losses(
+    losses: Tensor,             # (b,)
+    action_probe: Tensor,       # (b * k, t, ...)
+    *,
+    clip_mult = 10.,
+    eps = 1e-8
+) -> Tensor:
+    assert clip_mult > 0.
+
+    if not losses.requires_grad:
+        return losses
+
+    action_grads, = autograd.grad(losses.sum(), action_probe, retain_graph = True, only_inputs = True, allow_unused = True)
+
+    if not exists(action_grads):
+        return losses
+
+    grad_norms = reduce(action_grads.float().square(), '(b k) ... -> b', 'sum', b = size(losses, '[b]')).sqrt()
+    cap = clip_mult * grad_norms.median()
+
+    weights = (cap / grad_norms.clamp(min = eps)).clamp(max = 1.)
+    weights = torch.where(cap > 0., weights, 1.).to(losses.dtype).detach()
+
+    return losses * weights
 
 # actor
 
@@ -918,7 +948,9 @@ class SuperMimic(Module):
         dim_explorative_latent: int = 0,
         explorative_latent_scale: float = 0.25,
         antithetic_explorative_latent: bool = True,
-        wm_explorative_latent_scale: float = 0.
+        wm_explorative_latent_scale: float = 0.,
+        use_median_grad_clip: bool | None = None,
+        median_grad_clip_mult = 10.
     ):
         super().__init__()
         assert not (exists(actor_obs_key) and exists(state_to_obs)), 'pass either `actor_obs_key` or `state_to_obs`'
@@ -933,6 +965,13 @@ class SuperMimic(Module):
         self.explorative_latent_scale = explorative_latent_scale
         self.antithetic_explorative_latent = antithetic_explorative_latent
         self.wm_explorative_latent_scale = wm_explorative_latent_scale
+
+        # per-rollout median-relative gradient clipping - Dang & Edelkamp (2026)
+
+        assert median_grad_clip_mult > 0.
+        self.use_median_grad_clip = use_median_grad_clip
+        self.median_grad_clip_mult = median_grad_clip_mult
+        self._action_probe = None
 
         self.actor = actor
         self.world_model = world_model
@@ -1043,6 +1082,9 @@ class SuperMimic(Module):
             return to_one_hot(actions, self.num_discrete_actions, dtype)
         return actions
 
+    def should_median_grad_clip(self, horizon: int, override: bool | None = None) -> bool:
+        return default(override, default(self.use_median_grad_clip, horizon > 32))
+
     def critic_loss(
         self,
         states: State,          # (b t + 1 d)
@@ -1108,11 +1150,13 @@ class SuperMimic(Module):
         past_mask: Tensor | None = None,      # (b p) or (b,)
         action_smoothness_weight: float | None = None,
         discount_factor = None,
-        num_explorative_rollouts: int | None = None
+        num_explorative_rollouts: int | None = None,
+        use_median_grad_clip: bool | None = None,
+        median_grad_clip_mult: float | None = None
     ):
         discount_factor = default(discount_factor, self.discount_factor)
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
-        batch_size = size(rewards, '[b] t')
+        batch_size, horizon = shape(rewards, '[b] [t]')
 
         sim_context, final_goal, bootstrap_value, past_actions, past_mask = align_batch(
             (sim_context, final_goal, bootstrap_value, past_actions, past_mask),
@@ -1149,8 +1193,13 @@ class SuperMimic(Module):
             rewards, _ = pack([rewards, bootstrap_value], 'b *')
             gates, _ = pack([gates, torch.ones_like(bootstrap_value)], 'b *')
 
-        losses = -self.assoc_scan(gates, rewards)[:, 0]
-        return reduce_explorative_loss(losses, k)
+        losses = select_explorative_loss(-self.assoc_scan(gates, rewards)[:, 0], k)
+
+        if self.should_median_grad_clip(horizon, use_median_grad_clip) and losses.requires_grad:
+            assert exists(self._action_probe), 'pass `use_median_grad_clip = True` to `SuperMimic` or `forward`'
+            losses = median_clip_rollout_losses(losses, self._action_probe, clip_mult = default(median_grad_clip_mult, self.median_grad_clip_mult))
+
+        return losses.mean()
 
     def forward(
         self,
@@ -1167,7 +1216,8 @@ class SuperMimic(Module):
         num_explorative_rollouts: int | None = None,
         explorative_latent_scale: float | None = None,
         wm_explorative_latent_scale: float | None = None,
-        update_normalizer: bool | None = None
+        update_normalizer: bool | None = None,
+        use_median_grad_clip: bool | None = None
     ):
         actor, world_model = self.actor, self.world_model
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
@@ -1232,6 +1282,9 @@ class SuperMimic(Module):
 
         states, actions, rewards, terminals = [state], [], [], []
 
+        probe_actions = torch.is_grad_enabled() and self.should_median_grad_clip(num_rollout_timesteps, use_median_grad_clip)
+        action_probe = None
+
         obs_noise = default(self.observation_noise_dict, self.observation_noise_scale)
         structured = getattr(actor, 'structured_input', False)
         is_latent_wm = hasattr(world_model, 'encode') and hasattr(world_model, 'forward_from_latent')
@@ -1284,6 +1337,11 @@ class SuperMimic(Module):
                         differentiable = True
                     )
 
+                if probe_actions and action.requires_grad:
+                    if not exists(action_probe):
+                        action_probe = action.new_zeros((batch_size, num_rollout_timesteps, *action.shape[1:]), requires_grad = True)
+                    action = action + action_probe[:, t]
+
                 if exists(self.action_history):
                     act_cache = self.action_history.push(action, act_cache)
 
@@ -1321,5 +1379,7 @@ class SuperMimic(Module):
             terminals = self.termination_fn(next_states, references)
         else:
             terminals = rearrange(terminals, 't b -> b t') if terminals and exists(terminals[0]) else None
+
+        self._action_probe = action_probe
 
         return Rollout(states, actions, terminals, rewards)

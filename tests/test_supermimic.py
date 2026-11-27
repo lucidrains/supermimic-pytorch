@@ -954,3 +954,50 @@ def test_supermimic_wm_explorative_latent():
     actor_loss.backward()
     assert has_nonzero_grads(actor)
     assert not has_grads(world_model)
+
+# 9. per-rollout median gradient clipping (Dang & Edelkamp, 2026)
+
+def test_median_grad_clip():
+    torch.manual_seed(0)
+
+    wm = WorldModel(dim_state = 6, dim_action = 2, dim_sim_context = 0, dim_hiddens = (16,), pred_reward = True, pred_terminal = True)
+    with torch.no_grad():
+        wm.to_state_pred.weight.normal_(0., 0.15)
+
+    actor = MLP(6, 16, 2, activation = nn.GELU())
+    critic = Critic(dim_state = 6, dim_goal = 0, dim_sim_context = 0, dim_hiddens = (16,))
+    state, scales = torch.randn(5, 6), torch.ones(5, 1)
+    scales[0] = 500.
+
+    # default (None): off at horizon <= 32, auto-enabled at horizon > 32
+
+    sm_auto = SuperMimic(actor = actor, world_model = wm, critic = critic)
+    assert not exists(sm_auto.use_median_grad_clip)
+
+    r32 = sm_auto(state, num_rollout_timesteps = 32)
+    assert not exists(sm_auto._action_probe)
+    sm_auto.actor_loss(r32.rewards, r32.terminals, final_state = r32.states[:, -1]).backward()
+    assert has_nonzero_grads(actor) and not has_grads(wm) and not has_grads(critic)
+
+    actor.zero_grad()
+    r33 = sm_auto(state, num_rollout_timesteps = 33)
+    assert exists(sm_auto._action_probe)
+    sm_auto.actor_loss(r33.rewards * scales, r33.terminals, final_state = r33.states[:, -1]).backward()
+    clipped_norm = next(actor.parameters()).grad.norm()
+
+    # explicit False disables even at horizon > 32
+
+    actor.zero_grad()
+    sm_off = SuperMimic(actor = actor, world_model = wm, critic = critic, use_median_grad_clip = False)
+    r33_off = sm_off(state, num_rollout_timesteps = 33)
+    assert not exists(sm_off._action_probe)
+    sm_off.actor_loss(r33_off.rewards * scales, r33_off.terminals, final_state = r33_off.states[:, -1]).backward()
+    assert clipped_norm < next(actor.parameters()).grad.norm() * 0.5
+
+    # explicit True enables at short horizon + explorative rollouts (k = 2)
+
+    exp_actor = MLP(6 + 4, 16, 2, activation = nn.GELU())
+    sm_exp = SuperMimic(actor = exp_actor, world_model = wm, num_explorative_rollouts = 2, dim_explorative_latent = 4, use_median_grad_clip = True)
+    r_exp = sm_exp(state, num_rollout_timesteps = 4)
+    sm_exp.actor_loss(r_exp.rewards, r_exp.terminals).backward()
+    assert has_nonzero_grads(exp_actor) and not has_grads(wm)

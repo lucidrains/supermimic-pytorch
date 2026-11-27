@@ -434,7 +434,7 @@ def train(
     obs_window: int = 2, action_window: int = 1, encoder_hiddens = (128, 128), policy_hiddens = (256, 256, 256),
     wm_hiddens = (512, 512, 512), critic_hiddens = (256, 256), dim_explorative_latent: int = 4, num_explorative_rollouts: int = 2,
     wm_lr: float = 6e-4, actor_lr: float = 5e-4, critic_lr: float = 3e-4, ema_actor_decay: float = 0.96, critic_ema_decay: float = 0.99,
-    discount_factor: float = 0.99, gae_lam: float = 0.95,
+    discount_factor: float = 0.99, gae_lam: float = 0.95, use_median_grad_clip: bool | None = None, median_grad_clip_mult = 10.,
     # accelerate & logging
     mixed_precision: str = 'no', log_with: str | None = None, eval_every: int = 10, seed: int = 42, device: str = 'auto'
 ) -> dict[str, Any]:
@@ -577,7 +577,9 @@ def train(
         discount_factor = discount_factor,
         num_explorative_rollouts = num_explorative_rollouts,
         dim_explorative_latent = active_exp,
-        explorative_latent_scale = 0.20 if active_exp > 0 else 0.
+        explorative_latent_scale = 0.20 if active_exp > 0 else 0.,
+        use_median_grad_clip = use_median_grad_clip,
+        median_grad_clip_mult = median_grad_clip_mult
     ).to(dev)
 
     # replay buffer & rollouts

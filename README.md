@@ -229,3 +229,15 @@ $ uv run train_unitree_dog.py
     url     = {https://arxiv.org/abs/2409.14393},
 }
 ```
+
+```bibtex
+@misc{dang2026trustwhatrepeats,
+    title   = {Trust What Repeats: Capped World-Model Policy Gradients for Humanoid Motion Tracking},
+    author  = {Xuzhe Dang and Stefan Edelkamp},
+    year    = {2026},
+    eprint  = {2611.27648},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2611.27648},
+}
+```

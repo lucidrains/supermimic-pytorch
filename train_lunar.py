@@ -74,6 +74,10 @@ def pad_to_dim(x, dim: int):
     pad = dim - size(x, '... [d]')
     return pad_right_at_dim(x, pad, dim = -1) if pad > 0 else x
 
+def format_tags(*items):
+    tags = [tag for cond, tag in items if cond]
+    return f' ({", ".join(tags)})' if tags else ''
+
 # actor
 
 def init_history(actor, dim_state, dim_action, obs_window, action_window, pad_mode, per_slot_pad):
@@ -339,6 +343,8 @@ def main(
     critic_ema_decay = 0.99,
     observation_noise_scale = 0.005,
     max_grad_norm = 1.,
+    use_median_grad_clip: bool | None = None,
+    median_grad_clip_mult = 10.,
     state_loss_weight = 150.,
     discount_factor = 0.993,
     entropy_weight = 2e-3,
@@ -443,7 +449,9 @@ def main(
         num_explorative_rollouts = num_explorative_rollouts,
         dim_explorative_latent = active_latent_dim,
         explorative_latent_scale = explorative_latent_scale,
-        wm_explorative_latent_scale = wm_imag_explorative_latent_scale
+        wm_explorative_latent_scale = wm_imag_explorative_latent_scale,
+        use_median_grad_clip = use_median_grad_clip,
+        median_grad_clip_mult = median_grad_clip_mult
     ).to(device)
 
     # optimizers
@@ -719,9 +727,13 @@ def main(
                 best_eval = eval_mean
                 torch.save(ema_actor.ema_model.state_dict(), out_path / 'actor.pt')
 
-            tags = ([f'obs={obs_window}', f'act={action_window}', history_pad_mode] if prefix_len > 0 else []) + ([f'smooth={action_smoothness_weight}'] if action_smoothness_weight > 0 else [])
-            history_suffix = f' ({", ".join(tags)})' if tags else ''
-            save_returns_plot(train_returns, eval_steps, eval_means, out_path / 'returns.png', title = f'{env_name} — SuperMimic{history_suffix}')
+            suffix = format_tags(
+                (prefix_len > 0, f'obs={obs_window}, act={action_window}, {history_pad_mode}'),
+                (action_smoothness_weight > 0, f'smooth={action_smoothness_weight}'),
+                (imagination_horizon != 24, f'H={imagination_horizon}'),
+                (supermimic.should_median_grad_clip(imagination_horizon), f'medclip={median_grad_clip_mult:g}')
+            )
+            save_returns_plot(train_returns, eval_steps, eval_means, out_path / 'returns.png', title = f'{env_name} — SuperMimic{suffix}')
 
             if exists(target_return) and eval_mean >= target_return:
                 print(f'reached eval return {eval_mean:.1f} >= {target_return:.1f} at iter {iteration}, stopping early', flush = True)
