@@ -465,6 +465,29 @@ def rollout_step_weights(num_steps: int, decay: float) -> tuple[float, ...]:
     scale = num_steps / sum(weights)
     return tuple(w * scale for w in weights)
 
+# state-jacobian hinge reg - Fang et al. (2025)
+
+def state_jacobian_hinge_loss(
+    pred_state: Tensor,             # (b d)
+    state_in: Tensor,               # (b d), requires_grad = True
+    *,
+    margin: float = 1.,
+    num_probes: int = 1
+) -> Tensor:
+    assert margin >= 0. and num_probes >= 1
+
+    if not pred_state.requires_grad:
+        return pred_state.new_zeros(size(pred_state, '[b] d'))
+
+    sq_sum = pred_state.new_zeros(size(pred_state, '[b] d'))
+
+    for _ in range(num_probes):
+        v = torch.empty_like(pred_state).bernoulli_(0.5).mul_(2.).sub_(1.)
+        vjp, = autograd.grad((pred_state * v).sum(), state_in, create_graph = True, retain_graph = True)
+        sq_sum = sq_sum + reduce(vjp.square(), 'b d -> b', 'mean')
+
+    return (sq_sum / num_probes - margin).clamp(min = 0.)
+
 # per-rollout median gradient clipping - Dang & Edelkamp (2026)
 
 def median_clip_rollout_losses(
@@ -670,6 +693,7 @@ class Critic(Module):
 # world model
 
 Predictions = namedtuple('Predictions', ('state', 'terminal', 'reward'))
+EnsemblePredictions = namedtuple('EnsemblePredictions', ('state', 'terminal', 'reward', 'state_std', 'reward_std', 'epistemic_uncertainty'))
 
 Losses = namedtuple('Losses', ('state', 'terminal', 'reward'))
 
@@ -693,6 +717,8 @@ class WorldModel(Module):
         terminal_loss_weight = 1.,
         rollout_loss_decay: float = 1.,
         state_noise_scale: float = 0.,
+        jacobian_reg_weight: float = 0.,
+        jacobian_reg_margin: float = 1.,
         num_explorative_rollouts: int | None = None,
         dim_explorative_latent: int = 0,
         explorative_latent_scale: float = 0.25,
@@ -703,6 +729,7 @@ class WorldModel(Module):
         assert len(dim_hiddens) > 0
         assert 0. < rollout_loss_decay <= 1., '`rollout_loss_decay` must be in (0, 1]'
         assert state_noise_scale >= 0., '`state_noise_scale` must be non-negative'
+        assert jacobian_reg_weight >= 0. and jacobian_reg_margin >= 0.
 
         # explorative modeling - Gladstone et al. (2026); antithetic pairing - Jia et al. (2025)
 
@@ -750,13 +777,15 @@ class WorldModel(Module):
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_state = pred_residual_state
 
-        # losses (temporal decay rho^t - Hansen et al. 2024; training noise - Sanchez-Gonzalez et al. 2020)
+        # losses (temporal decay rho^t - Hansen et al. 2024; training noise - Sanchez-Gonzalez et al. 2020; jacobian reg - Fang et al. 2025)
 
         self.state_loss_weight = state_loss_weight
         self.reward_loss_weight = reward_loss_weight
         self.terminal_loss_weight = terminal_loss_weight
         self.rollout_loss_decay = float(rollout_loss_decay)
         self.state_noise_scale = float(state_noise_scale)
+        self.jacobian_reg_weight = float(jacobian_reg_weight)
+        self.jacobian_reg_margin = float(jacobian_reg_margin)
 
     def rollout(
         self,
@@ -771,6 +800,7 @@ class WorldModel(Module):
         explorative_latent_scale: float | None = None,
         rollout_loss_decay: float | None = None,
         state_noise_scale: float | None = None,
+        jacobian_reg_weight: float | None = None,
         update_normalizer: bool | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
@@ -779,6 +809,7 @@ class WorldModel(Module):
 
         decay = float(default(rollout_loss_decay, self.rollout_loss_decay))
         noise_scale = float(default(state_noise_scale, self.state_noise_scale))
+        jac_weight = float(default(jacobian_reg_weight, self.jacobian_reg_weight))
         step_weights = rollout_step_weights(num_steps, decay)
 
         orig_batch = batch_size_of(state)
@@ -835,6 +866,10 @@ class WorldModel(Module):
             if exists(next_rewards):
                 next_reward = next_rewards[:, time_index]
 
+            # scale step-0 jacobian reg by (num_steps / step_weight) so (wm_loss / num_steps) has exact weight `jac_weight`
+
+            step_jac_weight = (jac_weight * num_steps / step_weight) if (time_index == 0 and jac_weight > 0.) else 0.
+
             loss, pred, losses = self(
                 state,
                 action,
@@ -843,6 +878,7 @@ class WorldModel(Module):
                 next_terminal,
                 next_reward,
                 explorative_latent = explorative_latent,
+                jacobian_reg_weight = step_jac_weight,
                 reduce_loss = False,
                 update_normalizer = False
             )
@@ -866,6 +902,7 @@ class WorldModel(Module):
         next_reward: Tensor | None = None,
         *,
         explorative_latent: Tensor | None = None,
+        jacobian_reg_weight: float | None = None,
         reduce_loss: bool = True,
         update_normalizer: bool | None = None
     ):
@@ -892,6 +929,13 @@ class WorldModel(Module):
         # world model is just a forward dynamics model f(s, a, [xi, z]) -> s'
 
         norm_state = self.state_normalizer.normalize(state) if exists(self.state_normalizer) else state
+
+        need_loss = exists(flat_next_state) or exists(next_terminal) or exists(next_reward)
+        jac_weight = float(default(jacobian_reg_weight, self.jacobian_reg_weight))
+        apply_jac_reg = need_loss and self.training and torch.is_grad_enabled() and jac_weight > 0.
+
+        if apply_jac_reg and not norm_state.requires_grad:
+            norm_state = norm_state.detach().requires_grad_(True)
 
         embed = self.transition_mlp(compact(norm_state, action, sim_context, explorative_latent))
 
@@ -923,8 +967,6 @@ class WorldModel(Module):
 
         # maybe loss
 
-        need_loss = exists(flat_next_state) or exists(next_terminal) or exists(next_reward)
-
         if not need_loss:
             return pred
 
@@ -935,6 +977,10 @@ class WorldModel(Module):
             target_norm_next_state = self.state_normalizer.normalize(flat_next_state) if exists(self.state_normalizer) else flat_next_state
             state_loss = reduce(F.mse_loss(target_norm_next_state, pred_norm_next_state, reduction = 'none'), 'b d -> b', 'mean')
             total_loss = total_loss + state_loss * self.state_loss_weight
+
+        if apply_jac_reg:
+            jac_loss = state_jacobian_hinge_loss(pred_norm_next_state, norm_state, margin = self.jacobian_reg_margin)
+            total_loss = total_loss + jac_loss * jac_weight
 
         if exists(next_reward):
             assert exists(pred_reward)
@@ -956,7 +1002,7 @@ class WorldModel(Module):
 
 # main class
 
-Rollout = namedtuple('Rollout', ('states', 'actions', 'terminals', 'rewards'))
+Rollout = namedtuple('Rollout', ('states', 'actions', 'terminals', 'rewards', 'uncertainties'), defaults = (None,))
 
 class SuperMimic(Module):
     def __init__(
@@ -979,6 +1025,7 @@ class SuperMimic(Module):
         reward_fn: Module | Callable | None = None,
         termination_fn: Module | Callable | None = None,
         action_smoothness_weight: float = 0.,
+        epistemic_penalty_weight: float = 0.,
         discount_factor = 0.99,
         weight_critic_by_survival = True,
         discrete_action_temperature = 1.,
@@ -1035,7 +1082,10 @@ class SuperMimic(Module):
         self.goal_window = resolve_history(goal_window, future = True, pad_mode = 'replicate')
         self.obs_normalizer = resolve_normalizer(obs_normalizer)
 
+        assert epistemic_penalty_weight >= 0., '`epistemic_penalty_weight` must be non-negative'
+
         self.action_smoothness_weight = action_smoothness_weight
+        self.epistemic_penalty_weight = epistemic_penalty_weight
 
         # optional ema target critic
 
@@ -1187,6 +1237,8 @@ class SuperMimic(Module):
         past_actions: State | None = None,    # (b d_a) or (b p d_a)
         past_mask: Tensor | None = None,      # (b p) or (b,)
         action_smoothness_weight: float | None = None,
+        uncertainties: Tensor | None = None,  # (b t) or (b * k t)
+        epistemic_penalty_weight: float | None = None,
         discount_factor = None,
         num_explorative_rollouts: int | None = None,
         use_median_grad_clip: bool | None = None,
@@ -1196,8 +1248,8 @@ class SuperMimic(Module):
         k = default(num_explorative_rollouts, self.num_explorative_rollouts)
         batch_size, horizon = shape(rewards, '[b] [t]')
 
-        sim_context, final_goal, bootstrap_value, past_actions, past_mask = align_batch(
-            (sim_context, final_goal, bootstrap_value, past_actions, past_mask),
+        sim_context, final_goal, bootstrap_value, past_actions, past_mask, uncertainties = align_batch(
+            (sim_context, final_goal, bootstrap_value, past_actions, past_mask, uncertainties),
             batch_size
         )
 
@@ -1212,6 +1264,14 @@ class SuperMimic(Module):
             assert exists(actions), '`actions` required when `action_smoothness_weight > 0`'
             past_actions = self.maybe_one_hot_actions(past_actions, rewards.dtype)
             rewards = rewards - smoothness_weight * action_smoothness_penalty(actions, past_actions, past_mask = past_mask)
+
+        # epistemic uncertainty penalty - Yu et al. (2020, MOPO); Li, Krause & Hutter (2026, RWM-U)
+
+        epistemic_weight = default(epistemic_penalty_weight, self.epistemic_penalty_weight)
+        if epistemic_weight > 0.:
+            assert exists(uncertainties), '`uncertainties` required when `epistemic_penalty_weight > 0`'
+            assert_shape(uncertainties, 'b n', b = batch_size, n = horizon)
+            rewards = rewards - epistemic_weight * uncertainties
 
         # bootstrap value from frozen critic, unless passed in
 
@@ -1263,9 +1323,9 @@ class SuperMimic(Module):
 
         orig_batch = batch_size_of(initial_state)
 
-        wm_norm = getattr(world_model, 'state_normalizer', None)
-        if isinstance(wm_norm, WelfordNormalizer):
-            wm_norm.init_stats(initial_state)
+        for module in world_model.modules():
+            if isinstance(module, WelfordNormalizer):
+                module.init_stats(initial_state)
 
         if exists(self.obs_normalizer):
             init_obs = self.extract_obs(initial_state, sim_context)
@@ -1318,7 +1378,7 @@ class SuperMimic(Module):
 
         # rollout actor within frozen world model
 
-        states, actions, rewards, terminals = [state], [], [], []
+        states, actions, rewards, terminals, uncertainties = [state], [], [], [], []
 
         probe_actions = torch.is_grad_enabled() and self.should_median_grad_clip(num_rollout_timesteps, use_median_grad_clip)
         action_probe = None
@@ -1394,9 +1454,12 @@ class SuperMimic(Module):
                 actions.append(action)
                 rewards.append(pred.reward)
                 terminals.append(pred.terminal)
+                if isinstance(pred, EnsemblePredictions):
+                    uncertainties.append(pred.epistemic_uncertainty)
 
         states = inverse_state(rearrange(states, 't b ... -> b t ...'))
         actions = rearrange(actions, 't b ... -> b t ...')
+        uncertainties = rearrange(uncertainties, 't b -> b t') if uncertainties and exists(uncertainties[0]) else None
 
         if exists(self.reward_fn) or exists(self.termination_fn):
             next_states = tree_map_tensor(lambda x: x[:, 1:], states)
@@ -1420,4 +1483,4 @@ class SuperMimic(Module):
 
         self._action_probe = action_probe
 
-        return Rollout(states, actions, terminals, rewards)
+        return Rollout(states, actions, terminals, rewards, uncertainties)

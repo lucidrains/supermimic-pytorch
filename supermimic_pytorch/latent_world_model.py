@@ -30,6 +30,7 @@ from supermimic_pytorch.supermimic import (
     resolve_normalizer,
     rollout_step_weights,
     sample_explorative_latent,
+    state_jacobian_hinge_loss,
     to_one_hot
 )
 from supermimic_pytorch.welford_normalizer import WelfordNormalizer
@@ -80,6 +81,8 @@ class LatentWorldModel(Module):
         terminal_loss_weight = 1.,
         rollout_loss_decay: float = 1.,
         state_noise_scale: float = 0.,
+        jacobian_reg_weight: float = 0.,
+        jacobian_reg_margin: float = 1.,
         ema_decay = 0.999,
         freeze_autoencoder = True,
         num_explorative_rollouts: int | None = None,
@@ -92,6 +95,7 @@ class LatentWorldModel(Module):
         assert len(dim_hiddens) > 0
         assert 0. < rollout_loss_decay <= 1., '`rollout_loss_decay` must be in (0, 1]'
         assert state_noise_scale >= 0., '`state_noise_scale` must be non-negative'
+        assert jacobian_reg_weight >= 0. and jacobian_reg_margin >= 0.
 
         # explorative modeling - Gladstone et al. (2026); antithetic pairing - Jia et al. (2025)
 
@@ -163,7 +167,7 @@ class LatentWorldModel(Module):
         self.has_sim_context = dim_sim_context > 0
         self.pred_residual_latent = pred_residual_latent
 
-        # losses (temporal decay rho^t - Hansen et al. 2024; training noise - Sanchez-Gonzalez et al. 2020)
+        # losses (temporal decay rho^t - Hansen et al. 2024; training noise - Sanchez-Gonzalez et al. 2020; jacobian reg - Fang et al. 2025)
 
         self.state_loss_weight = state_loss_weight
         self.latent_loss_weight = latent_loss_weight
@@ -172,6 +176,8 @@ class LatentWorldModel(Module):
         self.terminal_loss_weight = terminal_loss_weight
         self.rollout_loss_decay = float(rollout_loss_decay)
         self.state_noise_scale = float(state_noise_scale)
+        self.jacobian_reg_weight = float(jacobian_reg_weight)
+        self.jacobian_reg_margin = float(jacobian_reg_margin)
 
     @property
     def has_recon_loss(self):
@@ -228,6 +234,7 @@ class LatentWorldModel(Module):
         explorative_latent_scale: float | None = None,
         rollout_loss_decay: float | None = None,
         state_noise_scale: float | None = None,
+        jacobian_reg_weight: float | None = None,
         update_normalizer: bool | None = None
     ):
         num_steps = size(actions, 'b [t] ...')
@@ -236,6 +243,7 @@ class LatentWorldModel(Module):
 
         decay = float(default(rollout_loss_decay, self.rollout_loss_decay))
         noise_scale = float(default(state_noise_scale, self.state_noise_scale))
+        jac_weight = float(default(jacobian_reg_weight, self.jacobian_reg_weight))
         step_weights = rollout_step_weights(num_steps, decay)
 
         orig_batch = batch_size_of(state)
@@ -292,6 +300,8 @@ class LatentWorldModel(Module):
             if exists(next_rewards):
                 next_reward = next_rewards[:, time_index]
 
+            step_jac_weight = (jac_weight * num_steps / step_weight) if (time_index == 0 and jac_weight > 0.) else 0.
+
             loss, pred, losses = self.forward_from_latent(
                 latent,
                 action,
@@ -300,6 +310,7 @@ class LatentWorldModel(Module):
                 next_terminal,
                 next_reward,
                 explorative_latent = explorative_latent,
+                jacobian_reg_weight = step_jac_weight,
                 reduce_loss = False,
                 update_normalizer = False
             )
@@ -324,6 +335,7 @@ class LatentWorldModel(Module):
         inverse_state = None,
         *,
         explorative_latent: Tensor | None = None,
+        jacobian_reg_weight: float | None = None,
         reduce_loss: bool = True,
         update_normalizer: bool | None = None
     ):
@@ -334,6 +346,13 @@ class LatentWorldModel(Module):
         assert self.has_sim_context == exists(sim_context)
 
         explorative_latent = resolve_explorative_latent(latent, explorative_latent, self.dim_explorative_latent)
+
+        need_loss = exists(next_state) or exists(next_terminal) or exists(next_reward)
+        jac_weight = float(default(jacobian_reg_weight, self.jacobian_reg_weight))
+        apply_jac_reg = need_loss and self.training and torch.is_grad_enabled() and jac_weight > 0.
+
+        if apply_jac_reg and not latent.requires_grad:
+            latent = latent.detach().requires_grad_(True)
 
         embed = self.transition_mlp(compact(latent, action, sim_context, explorative_latent))
 
@@ -378,8 +397,6 @@ class LatentWorldModel(Module):
 
         # maybe loss
 
-        need_loss = exists(next_state) or exists(next_terminal) or exists(next_reward)
-
         if not need_loss:
             return pred
 
@@ -400,6 +417,10 @@ class LatentWorldModel(Module):
             if self.has_recon_loss:
                 recon_loss = reduce(F.mse_loss(target_norm_next_state, self.state_decoder(self.state_encoder(target_norm_next_state)), reduction = 'none'), 'b d -> b', 'mean')
                 total_loss = total_loss + recon_loss * self.recon_loss_weight
+
+        if apply_jac_reg:
+            jac_loss = state_jacobian_hinge_loss(pred_latent, latent, margin = self.jacobian_reg_margin)
+            total_loss = total_loss + jac_loss * jac_weight
 
         if exists(next_reward):
             assert exists(pred_reward)
@@ -429,6 +450,7 @@ class LatentWorldModel(Module):
         next_reward: Tensor | None = None,
         *,
         explorative_latent: Tensor | None = None,
+        jacobian_reg_weight: float | None = None,
         reduce_loss: bool = True,
         update_normalizer: bool | None = None
     ):
@@ -452,6 +474,7 @@ class LatentWorldModel(Module):
             next_reward,
             inverse_state = inverse_state,
             explorative_latent = explorative_latent,
+            jacobian_reg_weight = jacobian_reg_weight,
             reduce_loss = reduce_loss,
             update_normalizer = False
         )

@@ -411,7 +411,7 @@ class AdversarialSuperMimic(Module):
             terms.append(pessimism_weight * realism_rewards)
 
         total_rewards = sum(terms[1:], terms[0]) if terms else task_rewards
-        return AdversarialRollout(*rollout[:3], total_rewards, task_rewards, motion_rewards, realism_rewards)
+        return AdversarialRollout(*rollout[:3], total_rewards, rollout.uncertainties, task_rewards, motion_rewards, realism_rewards)
 
     # AMP critic loss: unpaired reference mocap vs. policy rollout
 

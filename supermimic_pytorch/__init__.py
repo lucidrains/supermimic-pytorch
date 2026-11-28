@@ -11,7 +11,13 @@ from supermimic_pytorch.supermimic import (
     HistoryWindow,
     HistoryCache,
     action_smoothness_penalty,
-    median_clip_rollout_losses
+    median_clip_rollout_losses,
+    state_jacobian_hinge_loss,
+    EnsemblePredictions
+)
+
+from supermimic_pytorch.ensemble import (
+    WorldModelEnsemble
 )
 
 from supermimic_pytorch.rewards import (

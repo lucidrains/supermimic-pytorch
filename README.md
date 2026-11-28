@@ -279,3 +279,43 @@ $ uv run train_unitree_dog.py
     url     = {https://arxiv.org/abs/2610.26765},
 }
 ```
+
+```bibtex
+@inproceedings{fang2025worldmodelgeneralization,
+    title     = {Towards Unraveling and Improving Generalization in World Models},
+    author    = {Qiaoyi Fang and Weiyu Du and Hang Wang and Junshan Zhang},
+    booktitle = {Conference on Parsimony and Learning (CPAL)},
+    year      = {2025},
+    eprint    = {2501.00195},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url       = {https://arxiv.org/abs/2501.00195},
+}
+```
+
+```bibtex
+@inproceedings{yu2020mopo,
+    title     = {MOPO: Model-based Offline Policy Optimization},
+    author    = {Tianhe Yu and Garrett Thomas and Lantao Yu and Stefano Ermon and James Zou and Sergey Levine and Chelsea Finn and Tengyu Ma},
+    booktitle = {Advances in Neural Information Processing Systems (NeurIPS)},
+    volume    = {33},
+    pages     = {14129--14142},
+    year      = {2020},
+    eprint    = {2005.13239},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG},
+    url       = {https://arxiv.org/abs/2005.13239},
+}
+```
+
+```bibtex
+@misc{li2026uncertaintyawareroboticworldmodel,
+    title   = {Uncertainty-Aware Robotic World Model Makes Offline Model-Based Reinforcement Learning Work on Real Robots},
+    author  = {Chenhao Li and Andreas Krause and Marco Hutter},
+    year    = {2026},
+    eprint  = {2504.16680},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.RO},
+    url     = {https://arxiv.org/abs/2504.16680},
+}
+```
